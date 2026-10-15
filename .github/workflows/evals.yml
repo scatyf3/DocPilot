@@ -1,0 +1,76 @@
+# Replays the labeled questions through the API on PRs that touch prompts, chunking or
+# retrieval, and posts the score diff against evals/baseline.json as a sticky PR comment.
+name: Evals
+
+on:
+  pull_request:
+    paths:
+      - "api/src/docpilot/agent/**"
+      - "api/src/docpilot/ingest/**"
+      - "api/src/docpilot/retrieval/**"
+      - "api/src/docpilot/embeddings.py"
+      - "evals/**"
+      - ".github/workflows/evals.yml"
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  evals:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: docpilot
+          POSTGRES_PASSWORD: docpilot
+          POSTGRES_DB: docpilot
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U docpilot" --health-interval 2s --health-retries 30
+    env:
+      DATABASE_URL: postgresql://docpilot:docpilot@localhost:5432/docpilot
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      RERANK_API_KEY: ${{ secrets.RERANK_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: api/pyproject.toml
+      - run: pip install -e "api[dev]"
+
+      - name: Run eval suite
+        run: |
+          mkdir -p evals/results
+          if [ -n "$OPENAI_API_KEY" ]; then
+            EMBEDDER=openai
+          else
+            EMBEDDER=fake
+            echo "> No \`OPENAI_API_KEY\` secret: retrieval ran with the offline **fake** embedder (hashed bag-of-words), so vector numbers are not representative." > evals/results/notes.md
+          fi
+          ARGS="--embedder $EMBEDDER --output evals/results/pr.json"
+          if [ -n "$ANTHROPIC_API_KEY" ]; then
+            python -m evals.run $ARGS --llm anthropic
+          else
+            echo "> No \`ANTHROPIC_API_KEY\` secret: answer + judge eval skipped (retrieval only)." >> evals/results/notes.md
+            python -m evals.run $ARGS --retrieval-only
+          fi
+
+      - name: Build comment
+        run: |
+          python -m evals.compare evals/results/pr.json --out evals/results/diff.md
+          { cat evals/results/notes.md 2>/dev/null || true; echo; cat evals/results/diff.md; echo; cat evals/results/pr.md; } > evals/results/comment.md
+
+      - uses: marocchino/sticky-pull-request-comment@v2.9.0
+        with:
+          header: docpilot-evals
+          path: evals/results/comment.md
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: eval-results
+          path: evals/results/

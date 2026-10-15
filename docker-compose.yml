@@ -1,0 +1,41 @@
+# Local stack: Postgres+pgvector, the FastAPI backend and the Next.js frontend.
+#   cp .env.example .env   # add keys, or set LLM_PROVIDER=fake EMBEDDING_PROVIDER=fake
+#   docker compose up --build
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: docpilot
+      POSTGRES_PASSWORD: docpilot
+      POSTGRES_DB: docpilot
+    ports: ["5432:5432"]
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U docpilot"]
+      interval: 2s
+      retries: 30
+
+  api:
+    build: ./api
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DATABASE_URL: postgresql://docpilot:docpilot@db:5432/docpilot
+      CORS_ORIGINS: http://localhost:3000
+    command: sh -c "docpilot db init && uvicorn docpilot.app:app --host 0.0.0.0 --port 8000"
+    ports: ["8000:8000"]
+    volumes: ["./evals/corpus:/corpus:ro"]   # sample docs: docker compose exec api docpilot ingest /corpus
+    depends_on:
+      db: { condition: service_healthy }
+
+  web:
+    build:
+      context: ./web
+      args:
+        NEXT_PUBLIC_API_URL: http://localhost:8000
+    ports: ["3000:3000"]
+    depends_on: [api]
+
+volumes:
+  pgdata:

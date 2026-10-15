@@ -1,0 +1,33 @@
+# Fly.io config for the API. Secrets: fly secrets set DATABASE_URL=... ANTHROPIC_API_KEY=... OPENAI_API_KEY=...
+app = "docpilot-api"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[deploy]
+  release_command = "docpilot db init"
+
+[env]
+  LLM_PROVIDER = "anthropic"
+  EMBEDDING_PROVIDER = "openai"
+  RETRIEVAL_MODE = "hybrid"
+  CORS_ORIGINS = "https://docpilot.vercel.app"
+
+[http_service]
+  internal_port = 8000
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [[http_service.checks]]
+    method = "GET"
+    path = "/healthz"
+    interval = "30s"
+    timeout = "5s"
+    grace_period = "10s"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
