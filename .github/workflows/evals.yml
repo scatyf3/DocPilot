@@ -65,7 +65,7 @@ jobs:
           python -m evals.compare evals/results/pr.json --out evals/results/diff.md
           { cat evals/results/notes.md 2>/dev/null || true; echo; cat evals/results/diff.md; echo; cat evals/results/pr.md; } > evals/results/comment.md
 
-      - uses: marocchino/sticky-pull-request-comment@v2.9.0
+      - uses: marocchino/sticky-pull-request-comment@v3.0.5
         with:
           header: docpilot-evals
           path: evals/results/comment.md
