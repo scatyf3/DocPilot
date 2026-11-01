@@ -31,7 +31,7 @@ dev = [
     "ruff>=0.6",
 ]
 benchmarks = [
-    "huggingface_hub>=0.23",
+    "huggingface_hub>=2.4.0",
     "pyarrow>=16",
 ]
 
