@@ -27,7 +27,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=8",
-    "pytest-asyncio>=1.4",
+    "pytest-asyncio>=1.4.1",
     "ruff>=0.6",
 ]
 benchmarks = [
