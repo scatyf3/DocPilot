@@ -28,7 +28,7 @@ dependencies = [
 dev = [
     "pytest>=8",
     "pytest-asyncio>=1.4",
-    "ruff>=0.6",
+    "ruff>=0.17.3",
 ]
 benchmarks = [
     "huggingface_hub>=0.23",
