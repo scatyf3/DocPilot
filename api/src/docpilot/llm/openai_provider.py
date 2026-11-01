@@ -21,15 +21,18 @@ _STOP: dict[str, StopReason] = {
 class OpenAIProvider:
     def __init__(self, settings: Settings):
         self.model = settings.chat_model
-        self._client = AsyncOpenAI(api_key=settings.openai_api_key, base_url=settings.openai_base_url)
+        self._client = AsyncOpenAI(api_key=settings.openai_api_key, base_url=settings.openai_base_url,
+                                   timeout=settings.llm_timeout_seconds,
+                                   max_retries=settings.llm_max_retries)
 
     def start(self, history: list[dict], user_text: str) -> list:
         return [*({"role": m["role"], "content": m["content"]} for m in history),
                 {"role": "user", "content": user_text}]
 
     async def stream_turn(
-        self, system: str, messages: list, tools: list[ToolSpec]
+        self, system: str, messages: list, tools: list[ToolSpec], *, allow_tools: bool = True
     ) -> AsyncIterator[TextDelta | TurnResult]:
+        tool_choice = {} if allow_tools else {"tool_choice": "none"}
         stream = await self._client.chat.completions.create(
             model=self.model,
             messages=[{"role": "system", "content": system}, *messages],
@@ -37,6 +40,7 @@ class OpenAIProvider:
                     "function": {"name": t.name, "description": t.description,
                                  "parameters": t.parameters}}
                    for t in tools],
+            **tool_choice,
             stream=True,
             stream_options={"include_usage": True},
         )

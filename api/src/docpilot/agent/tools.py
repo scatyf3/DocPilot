@@ -4,6 +4,8 @@ Each tool's input is a pydantic model: its JSON Schema is what the model sees, a
 model validates whatever the model sends back, so schema and validation can't drift apart.
 """
 
+import logging
+import re
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -14,7 +16,10 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from docpilot.llm.base import ToolCall, ToolResult, ToolSpec
 from docpilot.retrieval.search import RetrievedChunk
 
+log = logging.getLogger(__name__)
 READ_DOC_MAX_CHUNKS = 40
+# Pages become searchable, so a prompt-injected model could otherwise plant text at volume.
+MAX_PAGES_PER_TURN = 1
 
 
 class SearchDocsArgs(BaseModel):
@@ -31,7 +36,7 @@ class ReadDocArgs(BaseModel):
 class CreatePageArgs(BaseModel):
     model_config = ConfigDict(extra="forbid")
     title: str = Field(min_length=1, max_length=200, description="Page title.")
-    markdown: str = Field(min_length=1, description="Full page body in Markdown.")
+    markdown: str = Field(min_length=1, max_length=50_000, description="Full page body in Markdown.")
 
 
 TOOLS: dict[str, tuple[type[BaseModel], str]] = {
@@ -56,8 +61,14 @@ TOOL_SPECS = [
 ]
 
 
+_CHUNK_TAG = re.compile(r"<(/?chunk)", re.IGNORECASE)
+
+
 def format_chunk(chunk_id: int, document_id: int, title: str, text: str) -> str:
-    title = title.replace('"', "'")
+    # Documents are untrusted: one must not be able to close its own tag and pose as another
+    # chunk, or as text outside any chunk.
+    title = title.replace('"', "'").replace("<", "&lt;")
+    text = _CHUNK_TAG.sub(r"&lt;\1", text)
     return f'<chunk id="{chunk_id}" doc_id="{document_id}" title="{title}">\n{text}\n</chunk>'
 
 
@@ -84,6 +95,7 @@ class Toolbox:
         self._search = search
         self._read = read_document
         self._create = create_page
+        self._pages_created = 0
 
     async def run(self, call: ToolCall) -> ToolOutcome:
         started = time.perf_counter()
@@ -92,7 +104,9 @@ class Toolbox:
         except ValidationError as e:
             outcome = self._error(call, f"invalid arguments: {e.errors(include_url=False)}")
         except Exception as e:  # a failing tool should not kill the turn; tell the model
-            outcome = self._error(call, f"{type(e).__name__}: {e}")
+            # Only the type: the message may quote hosts or keys, and this reaches the browser.
+            log.exception("tool %s failed", call.name)
+            outcome = self._error(call, f"the tool failed ({type(e).__name__})")
         outcome.duration_ms = round((time.perf_counter() - started) * 1000)
         return outcome
 
@@ -129,6 +143,9 @@ class Toolbox:
             )
 
         assert isinstance(args, CreatePageArgs)
+        if self._pages_created >= MAX_PAGES_PER_TURN:
+            return self._error(call, "a page was already saved in this turn")
+        self._pages_created += 1
         doc_id = await self._create(args.title, args.markdown)
         return ToolOutcome(
             result=ToolResult(call.id, f"Saved page {args.title!r} as document {doc_id}."),

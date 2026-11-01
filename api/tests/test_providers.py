@@ -101,3 +101,34 @@ async def test_openai_stitches_streamed_tool_call_fragments():
     assert (turn.input_tokens, turn.output_tokens) == (30, 9)
     provider.add_tool_results(messages, [ToolResult("call_a", "x"), ToolResult("call_b", "y")])
     assert [m["role"] for m in messages] == ["user", "assistant", "tool", "tool"]
+
+
+async def test_providers_can_forbid_tools_on_the_last_step():
+    settings = Settings(llm_provider="anthropic", anthropic_api_key="x", openai_api_key="x")
+    captured = {}
+
+    def stream(**kwargs):
+        captured.update(kwargs)
+        final = NS(content=[NS(type="text", text="ok")], stop_reason="end_turn",
+                   usage=NS(input_tokens=1, output_tokens=1))
+        return FakeAnthropicStream([NS(type="text", text="ok")], final)
+
+    anthropic = AnthropicProvider(settings)
+    anthropic._client = NS(messages=NS(stream=stream))
+    await drain(anthropic.stream_turn("sys", anthropic.start([], "q"), TOOL_SPECS, allow_tools=False))
+    assert captured["tool_choice"] == {"type": "none"} and captured["tools"]
+
+    openai_kwargs = {}
+
+    async def create(**kwargs):
+        openai_kwargs.update(kwargs)
+
+        async def chunks():
+            yield NS(usage=None, choices=[NS(delta=NS(content="ok", tool_calls=None), finish_reason="stop")])
+
+        return chunks()
+
+    openai = OpenAIProvider(settings)
+    openai._client = NS(chat=NS(completions=NS(create=create)))
+    await drain(openai.stream_turn("sys", openai.start([], "q"), TOOL_SPECS, allow_tools=False))
+    assert openai_kwargs["tool_choice"] == "none" and openai_kwargs["tools"]

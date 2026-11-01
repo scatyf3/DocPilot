@@ -1,7 +1,7 @@
 """Agent loop with the fake provider and a stubbed retrieval layer (no DB, no keys)."""
 
 from docpilot.agent.loop import Done, StepStart, ToolFinished, ToolStarted, run_agent
-from docpilot.agent.prompts import REFUSAL
+from docpilot.agent.prompts import INCOMPLETE, REFUSAL
 from docpilot.agent.tools import Toolbox
 from docpilot.llm.base import TextDelta, ToolCall, TurnResult
 from docpilot.llm.fake_provider import FakeProvider
@@ -60,11 +60,13 @@ class ScriptedProvider:
     def __init__(self, turns):
         self.turns = list(turns)
         self.tool_result_batches = []
+        self.allow_tools = []
 
     def start(self, history, user_text):
         return [{"role": "user", "content": user_text}]
 
-    async def stream_turn(self, system, messages, tools):
+    async def stream_turn(self, system, messages, tools, *, allow_tools=True):
+        self.allow_tools.append(allow_tools)
         turn = self.turns.pop(0)
         if turn.text:
             yield TextDelta(turn.text)
@@ -112,6 +114,25 @@ async def test_step_budget_is_enforced():
     assert sum(isinstance(e, StepStart) for e in events) == 3
     assert sum(isinstance(e, ToolFinished) for e in events) == 2
     assert events[-1].finish_reason == "other"
+    assert provider.allow_tools == [True, True, False]
+    assert events[-1].answer == INCOMPLETE  # a stubborn model still leaves something to show
+
+
+async def test_last_step_answers_from_what_it_found():
+    call = ToolCall("a", "search_docs", {"query": "x"})
+    provider = ScriptedProvider([TurnResult("", [call], "tool_use", 1, 1),
+                                 TurnResult("25 days [c:11]", [], "end", 1, 1)])
+    done = (await collect(provider, make_toolbox(), max_steps=2))[-1]
+    assert provider.allow_tools == [True, False]
+    assert done.answer == "25 days [c:11]" and done.finish_reason == "stop"
+
+
+async def test_empty_answers_are_replaced_with_a_note():
+    for stop, reason in [("max_tokens", "length"), ("end", "other")]:
+        provider = ScriptedProvider([TurnResult("", [], stop, 1, 1)])
+        events = await collect(provider, make_toolbox())
+        assert events[-1].answer == INCOMPLETE and events[-1].finish_reason == reason
+        assert "".join(e.text for e in events if isinstance(e, TextDelta)) == INCOMPLETE
 
 
 async def test_create_page_tool():
@@ -131,3 +152,15 @@ async def test_tool_schemas_forbid_extra_fields():
     assert set(by_name) == {"search_docs", "read_doc", "create_page"}
     assert by_name["search_docs"]["required"] == ["query"]
     assert all(p["additionalProperties"] is False for p in by_name.values())
+
+
+async def test_tool_failures_tell_the_model_without_leaking_details():
+    async def search(query, top_k):
+        raise RuntimeError("connection to postgres://user:hunter2@db-host refused")
+
+    async def unused(*args):
+        return None
+
+    outcome = await Toolbox(search, unused, unused).run(ToolCall("a", "search_docs", {"query": "x"}))
+    assert outcome.result.is_error and "RuntimeError" in outcome.result.content
+    assert "hunter2" not in outcome.result.content and "hunter2" not in outcome.summary

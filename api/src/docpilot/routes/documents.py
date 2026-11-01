@@ -1,22 +1,26 @@
 """Document library: upload, list, view, delete. Plus /search for debugging retrieval."""
 
-from fastapi import APIRouter, HTTPException, Request, UploadFile
+from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile
 from pydantic import BaseModel, Field
 
 from docpilot import store
 from docpilot.config import RerankerName, RetrievalMode
 from docpilot.ingest.pipeline import ingest_file
+from docpilot.security import rate_limit
 
 router = APIRouter()
 
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 
 
-@router.post("/documents", status_code=201)
+@router.post("/documents", status_code=201, dependencies=[Depends(rate_limit("upload"))])
 async def upload_document(request: Request, file: UploadFile) -> dict:
     s = request.app.state
+    # Multipart bodies are already spooled to disk here; don't pull an oversized one into memory.
+    if file.size is not None and file.size > MAX_UPLOAD_BYTES:
+        raise HTTPException(413, "file too large (max 20 MB)")
     data = await file.read()
-    if len(data) > MAX_UPLOAD_BYTES:
+    if len(data) > MAX_UPLOAD_BYTES:  # not every client declares a size
         raise HTTPException(413, "file too large (max 20 MB)")
     try:
         doc_id, n_chunks = await ingest_file(
@@ -47,13 +51,13 @@ async def delete_document(request: Request, doc_id: int) -> None:
 
 
 class SearchRequest(BaseModel):
-    query: str = Field(min_length=1)
+    query: str = Field(min_length=1, max_length=8000)
     top_k: int = Field(5, ge=1, le=50)
     mode: RetrievalMode | None = None
     reranker: RerankerName | None = None
 
 
-@router.post("/search")
+@router.post("/search", dependencies=[Depends(rate_limit("search"))])
 async def search(request: Request, body: SearchRequest) -> list[dict]:
     """Retrieval only, no LLM. The eval suite uses this to score recall@k and MRR."""
     chunks = await request.app.state.retriever.search(

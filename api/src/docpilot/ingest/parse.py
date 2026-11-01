@@ -39,9 +39,12 @@ def _first_heading(markdown: str) -> str | None:
 
 
 def _parse_pdf(data: bytes, fallback_title: str) -> ParsedDoc:
-    reader = PdfReader(io.BytesIO(data))
-    pages = [(page.extract_text() or "").strip() for page in reader.pages]
-    title = (reader.metadata.title if reader.metadata else None) or fallback_title
+    try:
+        reader = PdfReader(io.BytesIO(data))
+        pages = [(page.extract_text() or "").strip() for page in reader.pages]
+        title = (reader.metadata.title if reader.metadata else None) or fallback_title
+    except Exception as e:  # pypdf raises many types on corrupt or encrypted files
+        raise ValueError(f"could not read PDF: {type(e).__name__}") from e
     return ParsedDoc(title=title, text="\n\n".join(p for p in pages if p))
 
 

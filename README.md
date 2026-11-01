@@ -72,12 +72,15 @@ uvicorn docpilot.app:app --reload --port 8000
 # Web
 cd web
 npm install
-NEXT_PUBLIC_API_URL=http://localhost:8000 npm run dev     # http://localhost:3000
+API_URL=http://localhost:8000 npm run dev                 # http://localhost:3000
 
 # Tests
 cd api && pytest                       # unit tests need no DB and no keys
 DATABASE_URL=postgresql://... pytest   # also runs the DB-backed end-to-end test
 ```
+
+API dependencies are pinned in `api/requirements.txt`, which the Docker image installs. After changing `pyproject.toml`, regenerate it:
+`uv pip compile api/pyproject.toml --generate-hashes --python-version 3.12 -o api/requirements.txt`.
 
 ## Using the LLM Gateway
 
@@ -123,6 +126,41 @@ python -m evals.spotcheck evals/results/<run>.json -n 20    # hand-review sheet 
 
 CI (`.github/workflows/evals.yml`) runs on PRs that touch the agent prompt or tools, chunking, or retrieval, and updates a sticky comment with the diff. Without an `OPENAI_API_KEY` secret it falls back to the fake embedder. Without an `ANTHROPIC_API_KEY` secret it runs retrieval only. The comment says when either fallback was used.
 
+### Public retrieval benchmarks
+
+The 14-doc wiki has too few chunks (32) to separate retrievers, so `evals/benchmarks.py` also scores retrieval on four public datasets. It needs no LLM, and the data stays out of the repo.
+
+| dataset | what it tests | gold labels |
+|---|---|---|
+| HotpotQA (distractor config) | multi-hop questions over Wikipedia intros | human, both supporting articles |
+| MultiHop-RAG | long news articles, null queries | verbatim evidence quotes |
+| BEIR FiQA | vocabulary gap, published BM25 baselines | human qrels |
+| RAGBench TechQA | real IBM technotes | GPT-4 annotations (weak) |
+
+```bash
+pip install -e "api[dev,benchmarks]"
+export EVAL_DATA_DIR=/path/with/space
+python -m evals.benchmarks download
+python -m evals.benchmarks run --rerankers none,cohere --limit 1000
+```
+
+Check each dataset's license before redistributing it. Ingest embeds about 16M words, so use a GPU or budget for the API cost.
+
+Results below use local models (`BAAI/bge-m3` embeddings, `BAAI/bge-reranker-v2-m3` reranker), not the OpenAI and Cohere models configured by default, so only the full-text column is independent of the model choice. Up to 1000 sampled questions per dataset, 500/60 token chunks. Reranked figures use `top_k=5`, as the agent does.
+
+| dataset | chunks | questions | vector | BM25 | hybrid | hybrid + rerank |
+|---|---|---|---|---|---|---|
+| HotpotQA | 66,697 | 1000 | 0.700 | 0.711 | 0.753 | 0.870 |
+| MultiHop-RAG | 3,447 | 893 + 107 null | 0.430 | 0.527 | 0.523 | 0.536 |
+| BEIR FiQA | 60,924 | 648 | 0.391 | 0.228 | 0.354 | 0.394 |
+| RAGBench TechQA | 7,088 | 132 | 0.542 | 0.593 | 0.612 | 0.575 |
+
+Values are nDCG@10. `top_k=5` returns only five chunks, which caps the rerank column's nDCG@10; compare it with the others on recall@5 in the results file (for example, HotpotQA 0.746 hybrid against 0.868 reranked).
+
+What this changed:
+- Full-text search originally ranked with Postgres's `ts_rank_cd`, which has no inverse document frequency. It scored 0.061 on FiQA and pulled hybrid below vector-only on three of the four datasets. The 14-doc wiki couldn't show this. BM25 scores 0.228, close to the published baseline of about 0.25.
+- Chunks stay at 500 tokens: 300 tokens looked equally good on the wiki but significantly lowered recall@5 on MultiHop-RAG (-0.062, 95% CI -0.077 to -0.047).
+
 `evals/baseline.json` was produced offline with the **fake embedder** (retrieval only). After the first real run, regenerate it with `python -m evals.run --output evals/baseline.json` and commit it.
 
 ### Results: TO FILL after first real run
@@ -141,19 +179,28 @@ CI (`.github/workflows/evals.yml`) runs on PRs that touch the agent prompt or to
 | refusal accuracy | TBD |
 | p50 latency / cost per question | TBD |
 
+## Production notes
+
+- **Access:** the API requires a key from `API_KEYS` when `ENVIRONMENT=production`. Browsers go through the web app's server-side proxy (`web/src/app/api/backend`), which adds the key, and `WEB_PASSWORD` puts Basic Auth on the site. There are no user accounts: everyone who gets in shares one library, so this is not yet safe for mutually untrusting users.
+- **Rate limits:** per client and per instance, kept in memory, so N instances allow N times the limit. Web traffic counts as one client unless you set `TRUST_FORWARDED_FOR=true` on the web app and `CLIENT_IP_HEADER=x-client-ip` on the API. Only do that behind a platform that overwrites `x-forwarded-for` (Vercel does), because Next.js otherwise passes on whatever the client sent.
+- **Failures:** if embeddings or the reranker are down, retrieval degrades to what still works. A chat turn stops at `CHAT_TIMEOUT_SECONDS`. Clients get a request id, and details stay in the logs.
+- **Untrusted documents:** text from documents can't forge chunk boundaries, citations must point at chunks the model was shown, and answers with no valid citation are flagged in the UI. This limits prompt injection but does not prevent it: a document can still influence what the model writes.
+- **Schema changes:** add a numbered file to `api/src/docpilot/migrations/` and never edit an applied one. `docpilot db init` applies pending files in order. Migrations only go forward, so write a new one to undo a change.
+
 ## Deploy
 
 **API on Fly.io** (`api/fly.toml`):
 1. Run `fly launch --no-deploy` from `api/`.
-2. Set secrets: `fly secrets set DATABASE_URL=... ANTHROPIC_API_KEY=... OPENAI_API_KEY=...`.
-3. Run `fly deploy`. The release command runs `docpilot db init`, and `/healthz` is the health check.
+2. Set secrets: `fly secrets set DATABASE_URL=... API_KEYS=... ANTHROPIC_API_KEY=... OPENAI_API_KEY=...`. With `ENVIRONMENT=production` (set in `fly.toml`) the API refuses to start without `API_KEYS`.
+3. Run `fly deploy`. The release command runs `docpilot db init`. `/readyz` is the health check; `/healthz` only says the process is up.
 4. Set `CORS_ORIGINS` to your Vercel URL.
 
 **Database:** Neon or Supabase free tier. Both support `CREATE EXTENSION vector`.
 
 **Web on Vercel:**
 1. Import the repo with root directory `web/`.
-2. Set `NEXT_PUBLIC_API_URL=https://<your-app>.fly.dev`.
+2. Set `API_URL=https://<your-app>.fly.dev`, `API_KEY` (one of the API's `API_KEYS`), `WEB_PASSWORD` and `TRUST_FORWARDED_FOR=true`.
+3. Vercel caps request bodies at about 4.5 MB, so larger uploads need the Docker deployment instead.
 
 ## Repo map
 
@@ -162,7 +209,7 @@ api/
   src/docpilot/
     app.py              FastAPI factory, lifespan, CORS, /healthz
     config.py           all settings (env vars)
-    db.py, schema.sql   connection pool, plain-SQL schema (`docpilot db init`)
+    db.py, migrations/  connection pool, versioned plain-SQL migrations (`docpilot db init`)
     store.py            raw SQL for documents, messages, traces
     ingest/             parse (PDF/HTML/MD) -> heading-aware chunker -> pipeline
     embeddings.py       openai-compatible | fake

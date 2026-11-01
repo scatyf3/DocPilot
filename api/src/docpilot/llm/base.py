@@ -58,9 +58,13 @@ class LLMProvider(Protocol):
         ...
 
     def stream_turn(
-        self, system: str, messages: list, tools: list[ToolSpec]
+        self, system: str, messages: list, tools: list[ToolSpec], *, allow_tools: bool = True
     ) -> AsyncIterator[TextDelta | TurnResult]:
-        """Stream one model turn; appends the assistant turn to `messages` before finishing."""
+        """Stream one model turn; appends the assistant turn to `messages` before finishing.
+
+        With allow_tools=False the model must answer in text. `tools` is still sent, because
+        the history may hold tool calls and providers require the tools to stay defined.
+        """
         ...
 
     def add_tool_results(self, messages: list, results: list[ToolResult]) -> None:

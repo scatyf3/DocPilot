@@ -23,19 +23,19 @@ class FakeProvider:
         return [*history, {"role": "user", "content": user_text}]
 
     async def stream_turn(
-        self, system: str, messages: list, tools: list[ToolSpec]
+        self, system: str, messages: list, tools: list[ToolSpec], *, allow_tools: bool = True
     ) -> AsyncIterator[TextDelta | TurnResult]:
         question = next(m["content"] for m in reversed(messages) if m["role"] == "user")
         last = messages[-1]
 
-        if last["role"] == "user":
+        if last["role"] == "user" and allow_tools:
             call = ToolCall(id=f"call_{len(messages)}", name="search_docs", args={"query": question})
             messages.append({"role": "assistant", "tool_calls": [call]})
             yield TurnResult(text="", tool_calls=[call], stop_reason="tool_use",
                              input_tokens=_count(question), output_tokens=5)
             return
 
-        chunks = [m for r in last["results"] for m in _CHUNK.findall(r.content)]
+        chunks = [m for r in last.get("results", []) for m in _CHUNK.findall(r.content)]
         answer = _best_sentence(question, chunks) or REFUSAL
         for piece in re.findall(r"\S+\s*", answer):
             yield TextDelta(piece)

@@ -1,6 +1,6 @@
 """Reciprocal rank fusion.
 
-RRF merges ranked lists using only ranks, never raw scores: BM25-ish ts_rank and cosine
+RRF merges ranked lists using only ranks, never raw scores: BM25 and cosine
 similarity live on different scales, so adding them directly would be meaningless.
 score(d) = sum over lists of 1 / (k + rank_of_d_in_list), with 1-based ranks.
 k=60 is the constant from the original paper (Cormack et al., 2009); it damps the head.
