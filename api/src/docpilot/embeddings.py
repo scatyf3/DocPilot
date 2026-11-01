@@ -24,7 +24,9 @@ class Embedder(Protocol):
 class OpenAIEmbedder:
     def __init__(self, settings: Settings):
         self.name = f"openai:{settings.embedding_model}"
-        self._client = AsyncOpenAI(api_key=settings.openai_api_key, base_url=settings.openai_base_url)
+        self._client = AsyncOpenAI(api_key=settings.openai_api_key, base_url=settings.openai_base_url,
+                                   timeout=settings.embedding_timeout_seconds,
+                                   max_retries=settings.llm_max_retries)
         self._model = settings.embedding_model
         self._dim = settings.embedding_dim
         self._batch = settings.embedding_batch_size

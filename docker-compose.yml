@@ -30,10 +30,11 @@ services:
       db: { condition: service_healthy }
 
   web:
-    build:
-      context: ./web
-      args:
-        NEXT_PUBLIC_API_URL: http://localhost:8000
+    build: ./web
+    environment:
+      API_URL: http://api:8000
+      API_KEY: ${API_KEY:-}
+      WEB_PASSWORD: ${WEB_PASSWORD:-}
     ports: ["3000:3000"]
     depends_on: [api]
 

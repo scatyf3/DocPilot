@@ -27,6 +27,8 @@ export type TraceSummary = {
   output_tokens: number;
   latency_ms: number;
   cost_usd: number;
+  rejected_citation_ids?: number[];
+  ungrounded?: boolean;
 };
 
 export type TraceDetail = TraceSummary & { retrieved_chunks: Chunk[] };

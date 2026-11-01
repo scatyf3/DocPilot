@@ -1,5 +1,4 @@
--- DocPilot schema. Idempotent: `docpilot db init` runs it on every deploy.
--- Tables are created in the current search_path (DB_SCHEMA), so evals can use their own namespace.
+-- Initial schema. Uses IF NOT EXISTS so it also adopts databases created before migrations existed.
 
 CREATE TABLE IF NOT EXISTS documents (
     id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,

@@ -4,7 +4,8 @@ API rules this code relies on (current Claude models):
 - Adaptive thinking is always on; depth is set with output_config.effort, never budget_tokens.
 - The full `response.content` (thinking + tool_use blocks) goes back into history unchanged.
 - All tool_result blocks for one turn are sent back in a single user message.
-- tool_choice stays "auto"; the system prompt tells Claude when to search.
+- tool_choice is "auto" (the system prompt tells Claude when to search), or "none" on the
+  last allowed step so the turn ends in text. Forced "any"/"tool" would return a 400.
 """
 
 from collections.abc import AsyncIterator
@@ -23,7 +24,9 @@ _STOP: dict[str, StopReason] = {
 class AnthropicProvider:
     def __init__(self, settings: Settings):
         self.model = settings.anthropic_model
-        self._client = AsyncAnthropic(api_key=settings.anthropic_api_key)
+        self._client = AsyncAnthropic(api_key=settings.anthropic_api_key,
+                                      timeout=settings.llm_timeout_seconds,
+                                      max_retries=settings.llm_max_retries)
         self._effort = settings.anthropic_effort
         self._max_tokens = settings.max_output_tokens
 
@@ -32,8 +35,9 @@ class AnthropicProvider:
                 {"role": "user", "content": user_text}]
 
     async def stream_turn(
-        self, system: str, messages: list, tools: list[ToolSpec]
+        self, system: str, messages: list, tools: list[ToolSpec], *, allow_tools: bool = True
     ) -> AsyncIterator[TextDelta | TurnResult]:
+        tool_choice = {} if allow_tools else {"tool_choice": {"type": "none"}}
         # Tool inputs here are small, so we keep the API's default buffered tool-input
         # streaming: the server validates each input against its schema before sending it.
         async with self._client.messages.stream(
@@ -43,6 +47,7 @@ class AnthropicProvider:
             messages=messages,
             tools=[{"name": t.name, "description": t.description, "input_schema": t.parameters}
                    for t in tools],
+            **tool_choice,
             thinking={"type": "adaptive"},
             output_config={"effort": self._effort},
         ) as stream:

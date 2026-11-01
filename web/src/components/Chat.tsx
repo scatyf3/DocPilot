@@ -4,7 +4,7 @@ import { useChat } from "@ai-sdk/react";
 import { DefaultChatTransport } from "ai";
 import { useState } from "react";
 import { API_URL } from "@/lib/api";
-import type { ChatMessage, Chunk, RetrievalMode } from "@/lib/types";
+import type { ChatMessage, Chunk, RetrievalMode, TraceSummary } from "@/lib/types";
 import { AnswerText } from "./AnswerText";
 import { SourcePanel } from "./SourcePanel";
 import { TracePanel } from "./TracePanel";
@@ -98,7 +98,7 @@ function Message({ message, onCite }: { message: ChatMessage; onCite: (c: Chunk)
   }
 
   let citations: Chunk[] = [];
-  let trace = null;
+  let trace: TraceSummary | null = null;
   for (const part of message.parts) {
     if (part.type === "data-citations") citations = part.data;
     if (part.type === "data-trace") trace = part.data;
@@ -124,6 +124,11 @@ function Message({ message, onCite }: { message: ChatMessage; onCite: (c: Chunk)
         }
         return null;
       })}
+      {trace?.ungrounded && (
+        <p className="w-fit rounded bg-amber-50 px-2 py-1 text-xs text-amber-800">
+          No valid source: this answer may not come from your documents.
+        </p>
+      )}
       {trace && <TracePanel trace={trace} />}
     </div>
   );

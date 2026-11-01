@@ -1,7 +1,7 @@
 import pytest
 
 from docpilot.retrieval.fusion import rrf
-from docpilot.retrieval.search import fts_query
+from docpilot.retrieval.search import bm25_idf, select_terms, tsquery_literal
 
 
 def test_rrf_rewards_items_ranked_well_in_both_lists():
@@ -20,6 +20,20 @@ def test_rrf_empty():
     assert rrf([[], []]) == []
 
 
-def test_fts_query_ors_words_and_drops_punctuation():
-    assert fts_query("What's the SLO (p99)?") == "What | s | the | SLO | p99"
-    assert fts_query("?!") == ""
+def test_select_terms_prefers_rare_terms_within_budget():
+    freqs = {"the": 900, "policy": 90, "keystone": 3, "absent": 0}
+    assert select_terms(freqs, max_postings=1000) == ["keystone", "policy", "the"]
+    assert select_terms(freqs, max_postings=100) == ["keystone", "policy"]
+    assert select_terms({"common": 5000}, max_postings=100) == ["common"]  # never empty if any match
+    assert select_terms({"absent": 0}) == []
+
+
+def test_bm25_idf_favours_rare_terms_and_survives_stale_stats():
+    assert bm25_idf(1000, 3) > bm25_idf(1000, 500) > 0
+    assert bm25_idf(10, 50) > 0  # chunks uploaded since the stats were cached
+
+
+def test_tsquery_literal_quotes_for_the_tsquery_parser():
+    assert tsquery_literal("plain") == "'plain'"
+    assert tsquery_literal("o'neil") == "'o''neil'"
+    assert tsquery_literal("a\\b") == "'a\\\\b'"

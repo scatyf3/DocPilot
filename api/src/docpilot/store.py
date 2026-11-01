@@ -85,6 +85,18 @@ async def conversation_history(pool: AsyncConnectionPool, conversation_id: str) 
         return await cur.fetchall()
 
 
+async def retrieved_chunk_ids(pool: AsyncConnectionPool, conversation_id: str) -> list[int]:
+    """Every chunk a tool has returned so far in this conversation."""
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            """SELECT DISTINCT unnest(t.retrieved_chunk_ids) AS id
+               FROM traces t JOIN messages m ON m.id = t.message_id
+               WHERE m.conversation_id = %s""",
+            (conversation_id,),
+        )
+        return [r["id"] for r in await cur.fetchall()]
+
+
 async def save_turn(
     pool: AsyncConnectionPool, *, conversation_id: str, user_text: str,
     assistant_id: uuid.UUID, assistant_text: str, trace: dict[str, Any],
@@ -105,10 +117,11 @@ async def save_turn(
             (assistant_id, conversation_id, assistant_text),
         )
         await conn.execute(
-            """INSERT INTO traces (message_id, retrieved_chunk_ids, tool_calls, model,
-                                   input_tokens, output_tokens, latency_ms, cost_usd)
-               VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
-            (assistant_id, trace["retrieved_chunk_ids"], json.dumps(trace["tool_calls"]),
+            """INSERT INTO traces (message_id, retrieved_chunk_ids, rejected_citation_ids, tool_calls,
+                                   model, input_tokens, output_tokens, latency_ms, cost_usd)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+            (assistant_id, trace["retrieved_chunk_ids"], trace.get("rejected_citation_ids", []),
+             json.dumps(trace["tool_calls"]),
              trace["model"], trace["input_tokens"], trace["output_tokens"],
              trace["latency_ms"], trace["cost_usd"]),
         )
@@ -117,7 +130,7 @@ async def save_turn(
 async def get_trace(pool: AsyncConnectionPool, message_id: uuid.UUID) -> dict | None:
     async with pool.connection() as conn:
         trace = await (await conn.execute(
-            """SELECT message_id, retrieved_chunk_ids, tool_calls, model, input_tokens,
+            """SELECT message_id, retrieved_chunk_ids, rejected_citation_ids, tool_calls, model, input_tokens,
                       output_tokens, latency_ms, cost_usd::float AS cost_usd, created_at
                FROM traces WHERE message_id = %s""",
             (message_id,),

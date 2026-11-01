@@ -10,7 +10,9 @@ from pathlib import Path
 from evals.dataset import EVALS_DIR
 
 # Metrics where a lower number is better; everything else is higher-is-better.
-LOWER_IS_BETTER = {"false_refusal_rate", "latency_ms_p50", "latency_ms_p95", "cost_usd_total", "errors"}
+LOWER_IS_BETTER = {"false_refusal_rate", "latency_ms_p50", "latency_ms_p95", "cost_usd_total", "errors",
+                   "judge_errors", "unjudged", "no_search_rate", "incomplete_rate", "rejected_citations",
+                   "ungrounded_rate"}
 
 
 def flatten(result: dict) -> dict[str, float | None]:

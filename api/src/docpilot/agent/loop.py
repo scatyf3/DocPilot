@@ -11,7 +11,7 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
 
-from docpilot.agent.prompts import SYSTEM_PROMPT
+from docpilot.agent.prompts import INCOMPLETE, SYSTEM_PROMPT
 from docpilot.agent.tools import Toolbox, ToolOutcome
 from docpilot.llm.base import LLMProvider, TextDelta, ToolCall, TurnResult
 from docpilot.pricing import cost_usd
@@ -58,7 +58,10 @@ async def run_agent(
     for step in range(max_steps):
         yield StepStart(step)
         turn: TurnResult | None = None
-        async for event in provider.stream_turn(SYSTEM_PROMPT, messages, toolbox.specs):
+        # The last step can't call tools, so the model answers from what it has already found.
+        last_step = step == max_steps - 1
+        async for event in provider.stream_turn(SYSTEM_PROMPT, messages, toolbox.specs,
+                                                allow_tools=not last_step):
             if isinstance(event, TextDelta):
                 yield event
             else:
@@ -81,8 +84,8 @@ async def run_agent(
             break
         if not turn.tool_calls:
             break
-        if step == max_steps - 1:
-            finish_reason = "other"  # still wants tools after the step budget: stop here
+        if last_step:
+            finish_reason = "other"  # still asked for tools after the step budget: stop here
             break
 
         for call in turn.tool_calls:
@@ -95,6 +98,12 @@ async def run_agent(
                              "duration_ms": outcome.duration_ms})
             yield ToolFinished(call, outcome)
         provider.add_tool_results(messages, [o.result for o in outcomes])
+
+    if not turn.text and finish_reason != "content-filter":  # never end a turn with nothing to show
+        yield TextDelta(INCOMPLETE)
+        step_texts.append(INCOMPLETE)
+        if finish_reason == "stop":
+            finish_reason = "other"
 
     yield Done(
         answer="\n\n".join(step_texts),

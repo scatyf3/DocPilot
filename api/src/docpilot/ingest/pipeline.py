@@ -1,5 +1,7 @@
 """parse -> chunk -> embed -> store. Used by uploads, the CLI, evals and the create_page tool."""
 
+import asyncio
+
 from psycopg_pool import AsyncConnectionPool
 
 from docpilot import store
@@ -28,7 +30,8 @@ async def ingest_file(
     pool: AsyncConnectionPool, embedder: Embedder, settings: Settings,
     *, filename: str, data: bytes,
 ) -> tuple[int, int]:
-    parsed = parse_document(filename, data)
+    # Parsing a large PDF takes seconds of CPU; off the event loop, other requests keep flowing.
+    parsed = await asyncio.to_thread(parse_document, filename, data)
     return await ingest_text(
         pool, embedder, settings, title=parsed.title, text=parsed.text, source=filename
     )

@@ -1,7 +1,7 @@
-// Thin typed client for the FastAPI backend. NEXT_PUBLIC_API_URL is inlined at build time.
+// Thin typed client for the FastAPI backend, reached through the server-side proxy route.
 import type { DocumentDetail, DocumentSummary, TraceDetail } from "./types";
 
-export const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
+export const API_URL = "/api/backend";
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${API_URL}${path}`, init);
