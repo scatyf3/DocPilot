@@ -22,7 +22,7 @@ from docpilot.observability import JsonFormatter
 from docpilot.retrieval.search import RetrievedChunk, Retriever
 from docpilot.routes.chat import page_text, recent_history
 from docpilot.routes.documents import upload_document
-from docpilot.security import RateLimiter
+from docpilot.security import Principal, RateLimiter
 
 
 class StubConnection:
@@ -67,6 +67,11 @@ def make_client(monkeypatch):
     monkeypatch.setattr(store, "conversation_history", nothing)
     monkeypatch.setattr(store, "retrieved_chunk_ids", nothing)
 
+    async def claimed(*args, **kwargs):
+        return True
+
+    monkeypatch.setattr(store, "claim_conversation", claimed)
+
     def make(**settings):
         settings = {"llm_provider": "fake", "embedding_provider": "fake", **settings}
         return create_app(Settings(**settings)), pool
@@ -107,19 +112,19 @@ async def test_no_keys_means_open_in_development_and_refused_in_production(make_
 def test_rate_limiter_bursts_then_refills():
     now = [0.0]
     limiter = RateLimiter(clock=lambda: now[0])
-    assert [limiter.acquire("a", 2) for _ in range(2)] == [0.0, 0.0]
-    assert limiter.acquire("a", 2) == pytest.approx(30.0)
-    assert limiter.acquire("b", 2) == 0.0  # clients don't share a bucket
+    assert [limiter.take("a", 2) for _ in range(2)] == [0.0, 0.0]
+    assert limiter.take("a", 2) == pytest.approx(30.0)
+    assert limiter.take("b", 2) == 0.0  # clients don't share a bucket
     now[0] = 30.0
-    assert limiter.acquire("a", 2) == 0.0
-    assert limiter.acquire("a", 2) > 0
+    assert limiter.take("a", 2) == 0.0
+    assert limiter.take("a", 2) > 0
 
 
 def test_rate_limiter_memory_is_bounded():
     limiter = RateLimiter(clock=lambda: 0.0)
     limiter.MAX_CLIENTS = 3
     for i in range(10):
-        limiter.acquire(f"client-{i}", 5)
+        limiter.take(f"client-{i}", 5)
     assert len(limiter._buckets) <= 3
     assert "client-9" in limiter._buckets  # the newest stay, so a flood can't reset everyone at once
 
@@ -232,7 +237,7 @@ async def test_oversized_upload_without_a_declared_size_is_rejected(monkeypatch)
 
     request = NS(app=NS(state=NS()))
     with pytest.raises(HTTPException) as e:
-        await upload_document(request, Undeclared())
+        await upload_document(request, Undeclared(), Principal("anonymous", 1))
     assert e.value.status_code == 413
 
 
@@ -271,19 +276,20 @@ class FlakyRetriever(Retriever):
             raise outcome
         return outcome
 
-    async def _vector(self, query, limit, document_ids=None):
+    async def _vector(self, query, limit, tenant_id, document_ids=None):
         return await self._run("vector")
 
-    async def _fts(self, query, limit, document_ids=None):
+    async def _fts(self, query, limit, tenant_id, document_ids=None):
         return await self._run("fts")
 
 
 async def test_hybrid_survives_one_retriever_failing():
     down = RuntimeError("embedding API down")
-    assert [c.id for c in await FlakyRetriever(down, [CHUNK]).search("q", mode="hybrid")] == [1]
-    assert [c.id for c in await FlakyRetriever([CHUNK], down).search("q", mode="hybrid")] == [1]
+    for vector, fts in ((down, [CHUNK]), ([CHUNK], down)):
+        chunks = await FlakyRetriever(vector, fts).search("q", tenant_id=1, mode="hybrid")
+        assert [c.id for c in chunks] == [1]
     with pytest.raises(RuntimeError):
-        await FlakyRetriever(down, down).search("q", mode="hybrid")
+        await FlakyRetriever(down, down).search("q", tenant_id=1, mode="hybrid")
 
 
 async def test_reranker_failure_keeps_first_stage_order(monkeypatch):
@@ -292,7 +298,8 @@ async def test_reranker_failure_keeps_first_stage_order(monkeypatch):
             raise httpx.ConnectError("no route")
 
     monkeypatch.setattr("docpilot.retrieval.search.make_reranker", lambda name, settings: Down())
-    chunks = await FlakyRetriever([CHUNK], [CHUNK]).search("q", mode="hybrid", reranker="cohere")
+    chunks = await FlakyRetriever([CHUNK], [CHUNK]).search("q", tenant_id=1, mode="hybrid",
+                                                           reranker="cohere")
     assert [c.id for c in chunks] == [1]
 
 

@@ -15,16 +15,49 @@ RerankerName = Literal["none", "cohere"]
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=(".env", "../.env"), extra="ignore")
 
-    # production refuses to start without API keys; see security.py for what a key does and doesn't do.
+    # Production refuses to start without API keys or JWT secrets; see security.py.
     environment: Literal["development", "production"] = "development"
-    api_keys: str = ""  # comma-separated; several keys allow rotation without downtime
+    # Comma-separated service keys; several allow rotation without downtime. A key acts on the
+    # default tenant (id 1), which is also where everything from before multi-tenancy lives.
+    api_keys: str = ""
 
-    # Rate limits, per client, per instance.
+    # User accounts: access tokens are HS256 JWTs signed with the first secret and verified
+    # against all of them, so secrets rotate like API keys. Empty disables user login.
+    jwt_secrets: str = ""
+    access_token_ttl_seconds: int = 900
+    refresh_token_ttl_days: int = 30
+    allow_signup: bool = True
+    # argon2id cost. Each hash holds argon2_memory_kib of RAM, so hashing is also capped in
+    # concurrency: a burst of logins must not take the instance's memory with it.
+    argon2_time_cost: int = 3
+    argon2_memory_kib: int = 65536
+    argon2_parallelism: int = 4
+    password_hash_concurrency: int = 4
+
+    # Redis: shared rate limits, caches and the ingest queue. Without it, rate limits are per
+    # instance (N instances allow N times the limit) and nothing is cached.
+    redis_url: str | None = None
+    redis_timeout_seconds: float = 0.5  # an outage should degrade requests, not stall them
+
+    # Rate limits, per client (user, or IP for key holders and anonymous callers).
     rate_limit_enabled: bool = True
     rate_limit_chat_per_minute: int = 30
     rate_limit_search_per_minute: int = 120
     rate_limit_upload_per_minute: int = 10
+    rate_limit_auth_per_minute: int = 10
     client_ip_header: str | None = None  # e.g. fly-client-ip; only set it behind a trusted proxy
+
+    # Caches (need Redis; 0 disables). Search results are invalidated by any write to the tenant's
+    # library, so the TTL only bounds memory; query embeddings never go stale for a fixed model.
+    search_cache_ttl_seconds: int = 300
+    query_embedding_cache_ttl_seconds: int = 86_400
+
+    # Ingest: `inline` parses and embeds inside the upload request; `queue` stores the file,
+    # returns 202 with a job id and leaves the work to `docpilot worker` (needs Redis).
+    ingest_mode: Literal["inline", "queue"] = "inline"
+    worker_concurrency: int = 4
+    ingest_job_timeout_seconds: int = 900
+    ingest_job_max_tries: int = 3
 
     # Bounds on one chat turn.
     max_question_chars: int = 8000
@@ -45,6 +78,10 @@ class Settings(BaseSettings):
     db_pool_max_size: int = 10
     db_pool_timeout_seconds: float = 10.0  # waiting for a free connection
     db_statement_timeout_ms: int = 30_000  # one runaway query must not hold a connection forever
+    # The app's connections switch to this role, which row-level security applies to (table
+    # owners and superusers bypass it). `docpilot db init` creates it. Empty: rely on the
+    # tenant filters in the queries alone, e.g. on a host where you cannot create roles.
+    db_app_role: str = "docpilot_app"
 
     # Chat model.
     llm_provider: Literal["anthropic", "openai", "fake"] = "anthropic"
@@ -81,6 +118,10 @@ class Settings(BaseSettings):
     @property
     def api_key_list(self) -> list[str]:
         return [k.strip() for k in self.api_keys.split(",") if k.strip()]
+
+    @property
+    def jwt_secret_list(self) -> list[str]:
+        return [k.strip() for k in self.jwt_secrets.split(",") if k.strip()]
 
     @property
     def cors_origin_list(self) -> list[str]:

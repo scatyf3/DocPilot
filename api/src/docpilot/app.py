@@ -6,42 +6,75 @@ from contextlib import asynccontextmanager
 
 import openai
 import psycopg
+import redis.asyncio as aioredis
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from psycopg_pool import PoolTimeout
 
+from docpilot.auth import Passwords
+from docpilot.cache import RetrievalCache
 from docpilot.config import Settings, get_settings
 from docpilot.db import open_pool
 from docpilot.embeddings import make_embedder
 from docpilot.llm import make_provider
 from docpilot.observability import RequestContextMiddleware, configure_logging
 from docpilot.retrieval.search import Retriever
-from docpilot.routes import chat, documents
-from docpilot.security import RateLimiter, require_api_key
+from docpilot.routes import auth, chat, documents
+from docpilot.security import RateLimiter, RedisRateLimiter, get_principal
 
 log = logging.getLogger(__name__)
 READY_TIMEOUT_SECONDS = 3
 
 
+def make_redis(settings: Settings) -> aioredis.Redis | None:
+    if not settings.redis_url:
+        return None
+    # Short timeouts: Redis only speeds requests up or shares counters, so when it's slow we
+    # would rather go without it than wait.
+    return aioredis.from_url(settings.redis_url, socket_timeout=settings.redis_timeout_seconds,
+                             socket_connect_timeout=settings.redis_timeout_seconds)
+
+
+def check_settings(settings: Settings) -> None:
+    if settings.environment == "production":
+        if not settings.api_key_list and not settings.jwt_secret_list:
+            raise RuntimeError("ENVIRONMENT=production requires API_KEYS or JWT_SECRETS")
+        if any(len(s) < 32 for s in settings.jwt_secret_list):
+            raise RuntimeError("JWT_SECRETS must each be at least 32 characters in production")
+        if not settings.redis_url:
+            log.warning("no REDIS_URL: rate limits are per instance, and nothing is cached")
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or get_settings()
-    if settings.environment == "production" and not settings.api_key_list:
-        raise RuntimeError("ENVIRONMENT=production requires API_KEYS")
+    check_settings(settings)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         # Long-lived clients are built once and shared by every request via app.state.
         pool = await open_pool(settings)
         embedder = make_embedder(settings)
+        redis = make_redis(settings)
+        cache = None
+        if redis is not None:
+            app.state.rate_limiter = RedisRateLimiter(redis)
+            cache = RetrievalCache(redis, namespace=settings.db_schema,
+                                   search_ttl=settings.search_cache_ttl_seconds,
+                                   embedding_ttl=settings.query_embedding_cache_ttl_seconds)
         app.state.pool = pool
+        app.state.redis = redis
+        app.state.cache = cache
         app.state.embedder = embedder
-        app.state.retriever = Retriever(pool, embedder, settings)
+        app.state.retriever = Retriever(pool, embedder, settings, cache)
         app.state.llm = make_provider(settings)
+        app.state.passwords = Passwords(settings)
         try:
             yield
         finally:
             await pool.close()
+            if redis is not None:
+                await redis.aclose()
 
     app = FastAPI(title="DocPilot API", version="0.1.0", lifespan=lifespan)
     app.state.settings = settings
@@ -65,7 +98,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         log.warning("database failed: %s", type(exc).__name__)
         return JSONResponse({"detail": "database unavailable"}, status_code=503)
 
-    authenticated = [Depends(require_api_key)]
+    authenticated = [Depends(get_principal)]
+    app.include_router(auth.router)
     app.include_router(documents.router, dependencies=authenticated)
     app.include_router(chat.router, dependencies=authenticated)
 

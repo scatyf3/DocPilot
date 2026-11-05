@@ -24,7 +24,7 @@ from docpilot.chat_stream import ChatStreamEncoder
 from docpilot.config import RerankerName, RetrievalMode
 from docpilot.ingest.pipeline import ingest_text
 from docpilot.observability import request_id
-from docpilot.security import rate_limit
+from docpilot.security import CurrentPrincipal, rate_limit
 
 log = logging.getLogger(__name__)
 router = APIRouter()
@@ -65,41 +65,49 @@ class ChatRequest(BaseModel):
 
 
 @router.post("/chat", dependencies=[Depends(rate_limit("chat"))])
-async def chat(request: Request, body: ChatRequest) -> StreamingResponse:
+async def chat(request: Request, body: ChatRequest,
+               principal: CurrentPrincipal) -> StreamingResponse:
     question = body.question()
     if not question:
         raise HTTPException(422, "no user message to answer")
     s = request.app.state
     if len(question) > s.settings.max_question_chars:
         raise HTTPException(413, f"question too long (max {s.settings.max_question_chars} characters)")
+    tenant = principal.tenant_id
+    # Before anything is read: a colleague's conversation id must not let us continue it.
+    if not await store.claim_conversation(s.pool, tenant, principal.user_id, body.id):
+        raise HTTPException(404, "conversation not found")
     # The database, not the client, is the source of truth for earlier turns.
     history = [{"role": m["role"], "content": m["content"]}
-               for m in await store.conversation_history(s.pool, body.id)]
-    shown_earlier = await store.retrieved_chunk_ids(s.pool, body.id)
+               for m in await store.conversation_history(s.pool, tenant, body.id)]
+    shown_earlier = await store.retrieved_chunk_ids(s.pool, tenant, body.id)
     history = recent_history(history, s.settings.max_history_messages)
 
     scope = body.retrieval.document_ids
 
+    # The tools close over the caller's tenant. The model chooses queries and ids, never the
+    # tenant, so a prompt-injected document can't point it at another tenant's library.
     async def search(query: str, top_k: int):
         return await s.retriever.search(
-            query, top_k=top_k, mode=body.retrieval.mode, reranker=body.retrieval.reranker,
-            document_ids=scope,
+            query, tenant_id=tenant, top_k=top_k, mode=body.retrieval.mode,
+            reranker=body.retrieval.reranker, document_ids=scope,
         )
 
     async def read_document(doc_id: int):
         if scope is not None and doc_id not in scope:
             return None  # outside the chat's documents: same answer as a missing one
-        return await store.get_document(s.pool, doc_id)
+        return await store.get_document(s.pool, tenant, doc_id)
 
     async def create_page(title: str, markdown: str) -> int:
-        doc_id, _ = await ingest_text(s.pool, s.embedder, s.settings, title=title,
-                                      text=page_text(title, markdown), source="agent", kind="generated")
+        doc_id, _ = await ingest_text(s.pool, s.embedder, s.settings, tenant_id=tenant, title=title,
+                                      text=page_text(title, markdown), source="agent", kind="generated",
+                                      created_by=principal.user_id, cache=s.cache)
         return doc_id
 
     toolbox = Toolbox(search, read_document, create_page)
     events = run_agent(s.llm, toolbox, history, question, max_steps=s.settings.max_agent_steps)
     return StreamingResponse(
-        _encode(events, request, body.id, question, shown_earlier),
+        _encode(events, request, tenant, body.id, question, shown_earlier),
         media_type="text/event-stream",
         headers=ui.HEADERS,
     )
@@ -119,7 +127,8 @@ def recent_history(history: list[dict], limit: int) -> list[dict]:
 
 
 async def _encode(
-    events, request: Request, conversation_id: str, question: str, shown_earlier: list[int],
+    events, request: Request, tenant_id: int, conversation_id: str, question: str,
+    shown_earlier: list[int],
 ) -> AsyncIterator[str]:
     """Stream agent events as UI chunks; when the agent is done, resolve citations and persist."""
     pool = request.app.state.pool
@@ -150,8 +159,9 @@ async def _encode(
                     "cost_usd": event.trace["cost_usd"], "tool_calls": len(event.trace["tool_calls"]),
                     "rejected_citations": len(rejected), "ungrounded": event.trace["ungrounded"],
                 })
-                citations = await store.get_chunks(pool, valid)
-                await store.save_turn(pool, conversation_id=conversation_id, user_text=question,
+                citations = await store.get_chunks(pool, tenant_id, valid)
+                await store.save_turn(pool, tenant_id=tenant_id, conversation_id=conversation_id,
+                                      user_text=question,
                                       assistant_id=message_id, assistant_text=event.answer,
                                       trace=event.trace)
                 chunks = encoder.finish(citations, event.trace, event.finish_reason)
@@ -171,16 +181,22 @@ async def _encode(
 
 
 @router.get("/conversations/{conversation_id}")
-async def get_conversation(request: Request, conversation_id: str) -> dict:
-    messages = await store.conversation_history(request.app.state.pool, conversation_id)
+async def get_conversation(request: Request, conversation_id: str,
+                           principal: CurrentPrincipal) -> dict:
+    pool = request.app.state.pool
+    exists, owner = await store.conversation_owner(pool, principal.tenant_id, conversation_id)
+    messages = (await store.conversation_history(pool, principal.tenant_id, conversation_id)
+                if exists and owner == principal.user_id else [])
     if not messages:
         raise HTTPException(404, "conversation not found")
     return {"id": conversation_id, "messages": messages}
 
 
 @router.get("/traces/{message_id}")
-async def get_trace(request: Request, message_id: uuid.UUID) -> dict:
-    trace = await store.get_trace(request.app.state.pool, message_id)
+async def get_trace(request: Request, message_id: uuid.UUID,
+                    principal: CurrentPrincipal) -> dict:
+    trace = await store.get_trace(request.app.state.pool, principal.tenant_id, message_id,
+                                  principal.user_id)
     if trace is None:
         raise HTTPException(404, "trace not found")
     return trace

@@ -28,6 +28,7 @@ from docpilot.app import create_app
 from docpilot.cli import run_async
 from docpilot.config import Settings
 from docpilot.db import init_schema
+from docpilot.security import DEFAULT_TENANT_ID
 from evals.dataset import CORPUS_DIR, EVALS_DIR, Item, load_dataset
 from evals.metrics import contains, mean_or_none, recall_at_k, reciprocal_rank
 
@@ -107,7 +108,7 @@ async def eval_answers(client, pool, items: list[Item], mode: str, reranker: str
                     verdict = {"error": f"{type(e).__name__}: {e}"}
         quotes = [e.quote for e in item.evidence]
         trace = result["trace"] or {}
-        seen = await store.get_chunks(pool, trace.get("retrieved_chunk_ids", []))
+        seen = await store.get_chunks(pool, DEFAULT_TENANT_ID, trace.get("retrieved_chunk_ids", []))
         refused = is_refusal(result["answer"]) or bool(verdict and verdict.get("refused"))
         return {
             "id": item.id, "type": item.type, "question": item.question,

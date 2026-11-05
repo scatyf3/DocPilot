@@ -3,7 +3,10 @@
 We use raw SQL through psycopg 3 rather than an ORM so every query is visible and explainable.
 """
 
+import logging
 import re
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from importlib.resources import files
 
 import psycopg
@@ -13,6 +16,7 @@ from psycopg_pool import AsyncConnectionPool
 
 from docpilot.config import Settings
 
+log = logging.getLogger(__name__)
 _SCHEMA_NAME = re.compile(r"^[a-z_][a-z0-9_]*$")
 _MIGRATION_FILE = re.compile(r"^(\d{4})_\w+\.sql$")
 
@@ -32,13 +36,29 @@ async def _configure(conn: psycopg.AsyncConnection) -> None:
     await register_vector_async(conn)
 
 
-async def open_pool(settings: Settings) -> AsyncConnectionPool:
+def _app_role(settings: Settings) -> str | None:
+    role = settings.db_app_role
+    if role and not _SCHEMA_NAME.match(role):
+        raise ValueError(f"invalid DB_APP_ROLE {role!r}")
+    return role or None
+
+
+async def open_pool(settings: Settings, *, as_owner: bool = False) -> AsyncConnectionPool:
+    """The app's pool. Its connections run as DB_APP_ROLE, so row-level security applies.
+
+    `as_owner` keeps the connecting role instead, for maintenance that spans tenants (the
+    worker's sweeper, benchmarks). Nothing that serves a request should use it.
+    """
+    role = None if as_owner else _app_role(settings)
+
     async def configure(conn: psycopg.AsyncConnection) -> None:
         await _configure(conn)
         # Only the app's pool: migrations may legitimately run longer than a request should.
         # SET, not a startup `options` parameter, which connection poolers like PgBouncer reject.
         await conn.set_autocommit(True)
         await conn.execute(f"SET statement_timeout = {int(settings.db_statement_timeout_ms)}")
+        if role:
+            await conn.execute(f"SET ROLE {role}")
         await conn.set_autocommit(False)
 
     pool = AsyncConnectionPool(
@@ -53,6 +73,19 @@ async def open_pool(settings: Settings) -> AsyncConnectionPool:
     )
     await pool.open(wait=True)
     return pool
+
+
+@asynccontextmanager
+async def tenant_connection(pool: AsyncConnectionPool, tenant_id: int,
+                            ) -> AsyncIterator[psycopg.AsyncConnection]:
+    """A pooled connection inside a transaction that row-level security scopes to one tenant.
+
+    set_config(..., true) is transaction-local, like SET LOCAL: it ends with the transaction,
+    so a connection returned to the pool never carries a tenant into its next borrower.
+    """
+    async with pool.connection() as conn:
+        await conn.execute("SELECT set_config('app.tenant_id', %s, true)", (str(int(tenant_id)),))
+        yield conn
 
 
 def _migrations() -> list[tuple[int, str, str]]:
@@ -103,5 +136,32 @@ async def init_schema(settings: Settings, reset: bool = False) -> None:
                             "INSERT INTO schema_migrations (version, name) VALUES (%s, %s)",
                             (version, name),
                         )
+            if role := _app_role(settings):
+                await _grant_app_role(conn, schema, role)
         finally:
             await conn.execute("SELECT pg_advisory_unlock(hashtext('docpilot:init_schema'))")
+
+
+async def _grant_app_role(conn: psycopg.AsyncConnection, schema: str, role: str) -> None:
+    """Create the role the app runs as, and let it use (not alter) this schema's tables.
+
+    Re-run on every init, so tables added by later migrations are covered too.
+    """
+    try:
+        await conn.execute(
+            f"""DO $$ BEGIN
+                    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '{role}') THEN
+                        CREATE ROLE {role} NOLOGIN;
+                    END IF;
+                END $$""")
+        # The connecting role must be a member to SET ROLE to it (superusers always may).
+        await conn.execute(f"GRANT {role} TO CURRENT_USER")
+    except psycopg.errors.InsufficientPrivilege as e:
+        raise RuntimeError(
+            f"cannot create or join role {role!r} ({e}). Create it yourself (CREATE ROLE {role} "
+            f"NOLOGIN; GRANT {role} TO <your user>), or set DB_APP_ROLE= to run without "
+            "row-level security, relying on the tenant filters in queries alone."
+        ) from e
+    await conn.execute(f"GRANT USAGE ON SCHEMA {schema} TO {role}")
+    await conn.execute(f"GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA {schema} TO {role}")
+    await conn.execute(f"GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA {schema} TO {role}")

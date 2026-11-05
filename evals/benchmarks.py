@@ -53,9 +53,10 @@ from docpilot import store
 from docpilot.app import create_app
 from docpilot.cli import run_async
 from docpilot.config import Settings
-from docpilot.db import init_schema
+from docpilot.db import init_schema, tenant_connection
 from docpilot.ingest.chunk import approx_tokens, chunk_text
 from docpilot.retrieval.rerank import CohereReranker
+from docpilot.security import DEFAULT_TENANT_ID
 from evals.dataset import EVALS_DIR
 from evals.metrics import contains, mean_or_none, normalize
 
@@ -252,7 +253,7 @@ async def ingest(app, settings: Settings, docs: dict[str, str]) -> dict[str, int
     async def one(key: str, doc_chunks: list[str], doc_embeddings: list) -> None:
         async with sem:
             ids[key] = await store.insert_document(
-                app.state.pool, title=key, source=key, kind="upload",
+                app.state.pool, tenant_id=DEFAULT_TENANT_ID, title=key, source=key, kind="upload",
                 chunks=doc_chunks, embeddings=doc_embeddings)
 
     tasks = []
@@ -265,7 +266,7 @@ async def ingest(app, settings: Settings, docs: dict[str, str]) -> dict[str, int
 
 async def existing_doc_ids(app, bench: Benchmark) -> dict[str, int]:
     """Document key -> id for a schema ingested earlier (ingest stores the key as the title)."""
-    async with app.state.pool.connection() as conn:
+    async with tenant_connection(app.state.pool, DEFAULT_TENANT_ID) as conn:
         rows = await (await conn.execute("SELECT id, title FROM documents")).fetchall()
     by_title = {r["title"]: r["id"] for r in rows}
     return {k: by_title[k] for k in bench.docs if k in by_title}
@@ -378,7 +379,7 @@ async def run_dataset(name: str, args) -> dict:
             doc_ids = await existing_doc_ids(app, bench)
         else:
             doc_ids = await ingest(app, settings, bench.docs)
-        async with app.state.pool.connection() as conn:
+        async with tenant_connection(app.state.pool, DEFAULT_TENANT_ID) as conn:
             out["n_chunks"] = (await (await conn.execute("SELECT count(*) AS n FROM chunks")).fetchone())["n"]
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://bench", timeout=600) as client:

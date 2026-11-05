@@ -9,6 +9,7 @@ from docpilot.config import get_settings
 from docpilot.db import init_schema, open_pool
 from docpilot.embeddings import make_embedder
 from docpilot.ingest.pipeline import ingest_file
+from docpilot.security import DEFAULT_TENANT_ID
 
 
 def run_async(coro):
@@ -18,13 +19,13 @@ def run_async(coro):
     return asyncio.run(coro)
 
 
-async def _ingest(paths: list[Path]) -> None:
+async def _ingest(paths: list[Path], tenant_id: int) -> None:
     settings = get_settings()
     pool = await open_pool(settings)
     embedder = make_embedder(settings)
     try:
         for path in paths:
-            doc_id, n = await ingest_file(pool, embedder, settings,
+            doc_id, n = await ingest_file(pool, embedder, settings, tenant_id=tenant_id,
                                           filename=path.name, data=path.read_bytes())
             print(f"ingested {path.name}: document {doc_id}, {n} chunks")
     finally:
@@ -39,6 +40,8 @@ def main() -> None:
     db_sub.add_parser("init", help="create the pgvector extension and all tables (idempotent)")
     ingest = sub.add_parser("ingest", help="ingest PDF/Markdown/HTML files")
     ingest.add_argument("paths", nargs="+", type=Path)
+    ingest.add_argument("--tenant", type=int, default=DEFAULT_TENANT_ID,
+                        help="tenant that owns the documents (default: 1, the API-key tenant)")
     args = parser.parse_args()
 
     if args.cmd == "db":
@@ -46,7 +49,7 @@ def main() -> None:
         print("schema ready")
     elif args.cmd == "ingest":
         files = [p for path in args.paths for p in (sorted(path.iterdir()) if path.is_dir() else [path])]
-        run_async(_ingest(files))
+        run_async(_ingest(files, args.tenant))
 
 
 if __name__ == "__main__":
