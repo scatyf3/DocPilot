@@ -58,7 +58,7 @@ from docpilot.agent.prompts import is_refusal
 from docpilot.cli import run_async
 from docpilot.config import Settings
 from docpilot.db import init_schema
-from evals.bench_matrix import serve
+from evals.bench_matrix import llm_ms, serve
 from evals.benchmarks import (
     DATA_DIR,
     FLOAT_PREFIX,
@@ -220,6 +220,7 @@ async def run(args) -> None:
                                   for c in result["citations"]],
                     "tool_calls": [t["name"] for t in trace.get("tool_calls", [])],
                     "latency_ms": trace.get("latency_ms") or round((time.perf_counter() - started) * 1000),
+                    "llm_ms": llm_ms(trace),
                     "input_tokens": trace.get("input_tokens", 0),
                     "output_tokens": trace.get("output_tokens", 0)}
             async with lock:

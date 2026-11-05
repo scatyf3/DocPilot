@@ -95,6 +95,14 @@ def answer_matches(answer: str, reference: str) -> bool:
     return f" {ref} " in f" {got} "
 
 
+def llm_ms(trace: dict) -> int | None:
+    """Turn time minus tool time: the model's share. Tools that ran in parallel are summed,
+    so this slightly undercounts it (by under a second at p50 in the 2026-11 runs)."""
+    if trace.get("latency_ms") is None:
+        return None
+    return trace["latency_ms"] - sum(t.get("duration_ms", 0) for t in trace.get("tool_calls", []))
+
+
 def cited_gold(citations: list[dict], item: BenchItem, kind: str) -> bool:
     if kind == "doc":  # ingest stores the document key as the title
         return any(c["title"] in item.units for c in citations)
@@ -131,7 +139,8 @@ async def answer_items(client, items: list[BenchItem], kind: str, mode: str, rer
             "finish_reason": result["finish_reason"],
             "tool_calls": [t["name"] for t in trace.get("tool_calls", [])],
             "ungrounded": trace.get("ungrounded", False),
-            "latency_ms": trace.get("latency_ms"), "cost_usd": trace.get("cost_usd", 0.0),
+            "latency_ms": trace.get("latency_ms"), "llm_ms": llm_ms(trace),
+            "cost_usd": trace.get("cost_usd", 0.0),
             "input_tokens": trace.get("input_tokens", 0), "output_tokens": trace.get("output_tokens", 0),
         }
 
