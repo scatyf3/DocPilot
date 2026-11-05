@@ -78,18 +78,21 @@ class Retriever:
     async def search(
         self, query: str, *, top_k: int = 5,
         mode: RetrievalMode | None = None, reranker: RerankerName | None = None,
+        document_ids: list[int] | None = None,
     ) -> list[RetrievedChunk]:
+        """`document_ids` limits the search to those documents (None = the whole library)."""
         mode = mode or self._settings.retrieval_mode
         reranker = reranker or self._settings.reranker
         n = self._settings.candidate_k
 
         if mode == "vector":
-            candidates = await self._vector(query, n)
+            candidates = await self._vector(query, n, document_ids)
         elif mode == "fts":
-            candidates = await self._fts(query, n)
+            candidates = await self._fts(query, n, document_ids)
         else:
             # Two independent queries on separate pooled connections: run them concurrently.
-            vec, fts = await asyncio.gather(self._vector(query, n), self._fts(query, n),
+            vec, fts = await asyncio.gather(self._vector(query, n, document_ids),
+                                            self._fts(query, n, document_ids),
                                             return_exceptions=True)
             vec, fts = _survivors(vec, fts)
             by_id = {c.id: c for c in [*fts, *vec]}
@@ -108,14 +111,27 @@ class Retriever:
                 candidates = [_with_score(head[i], score) for i, score in order]
         return candidates[:top_k]
 
-    async def _vector(self, query: str, limit: int) -> list[RetrievedChunk]:
+    async def _vector(self, query: str, limit: int, document_ids: list[int] | None = None,
+                      ) -> list[RetrievedChunk]:
         [embedding] = await self._embedder.embed([query])
-        sql = f"""SELECT {_COLUMNS}, 1 - (c.embedding <=> %(q)s) AS score
-                  FROM chunks c JOIN documents d ON d.id = c.document_id
+        if document_ids is None:
+            sql = f"""SELECT {_COLUMNS}, 1 - (c.embedding <=> %(q)s) AS score
+                      FROM chunks c JOIN documents d ON d.id = c.document_id
+                      ORDER BY c.embedding <=> %(q)s LIMIT %(limit)s"""
+            return await self._fetch(sql, {"q": embedding, "limit": limit})
+        # The HNSW index filters after it finds neighbours, so limiting a big library to one
+        # document could return almost nothing. A materialized CTE cannot use that index:
+        # the filtered chunks are scanned exactly, which is cheap for a handful of documents.
+        sql = f"""WITH c AS MATERIALIZED (
+                      SELECT c.id, c.document_id, c.ord, c.text, c.embedding
+                      FROM chunks c WHERE c.document_id = ANY(%(docs)s))
+                  SELECT {_COLUMNS}, 1 - (c.embedding <=> %(q)s) AS score
+                  FROM c JOIN documents d ON d.id = c.document_id
                   ORDER BY c.embedding <=> %(q)s LIMIT %(limit)s"""
-        return await self._fetch(sql, {"q": embedding, "limit": limit})
+        return await self._fetch(sql, {"q": embedding, "limit": limit, "docs": document_ids})
 
-    async def _fts(self, query: str, limit: int) -> list[RetrievedChunk]:
+    async def _fts(self, query: str, limit: int, document_ids: list[int] | None = None,
+                   ) -> list[RetrievedChunk]:
         """BM25, computed from the tsvector.
 
         Postgres's own ts_rank has no inverse document frequency: in a question, "the" and
@@ -139,6 +155,8 @@ class Retriever:
             if not terms:
                 return []
             n_chunks, mean_length = await self._corpus_stats(conn)
+        # IDF and mean length stay library-wide when the search is limited to some documents.
+        scope = "" if document_ids is None else "AND c.document_id = ANY(%(docs)s)"
         sql = f"""WITH scored AS (
                       SELECT c.id, sum(w.idf * cardinality(u.positions) * (%(k1)s + 1)
                                        / (cardinality(u.positions) + %(k1)s * (1 - %(b)s + %(b)s
@@ -147,7 +165,7 @@ class Retriever:
                       CROSS JOIN LATERAL unnest(c.tsv) AS u
                       JOIN unnest(%(terms)s::text[], %(idf)s::float8[]) AS w(lexeme, idf)
                         ON w.lexeme = u.lexeme
-                      WHERE c.tsv @@ %(any_term)s::tsquery
+                      WHERE c.tsv @@ %(any_term)s::tsquery {scope}
                       GROUP BY c.id ORDER BY score DESC, c.id LIMIT %(limit)s
                   )
                   SELECT {_COLUMNS}, s.score
@@ -156,7 +174,7 @@ class Retriever:
         return await self._fetch(sql, {
             "k1": BM25_K1, "b": BM25_B, "mean_length": mean_length, "limit": limit, "terms": terms,
             "idf": [bm25_idf(n_chunks, doc_freqs[t]) for t in terms],
-            "any_term": " | ".join(tsquery_literal(t) for t in terms),
+            "any_term": " | ".join(tsquery_literal(t) for t in terms), "docs": document_ids,
         })
 
     async def _corpus_stats(self, conn) -> tuple[int, float]:

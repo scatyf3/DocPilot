@@ -8,6 +8,22 @@
   multihop  MultiHop-RAG: long news articles; gold = verbatim evidence quotes; has null queries
   fiqa      BEIR FiQA test: finance forum, vocabulary gap; human qrels, published BM25 baselines
   techqa    RAGBench TechQA: IBM technotes; gold = documents GPT-4 marked relevant (weak labels)
+  qasper    QASPER dev: questions about one NLP paper each, asked from its title and abstract;
+            gold = evidence paragraphs (or table/figure captions) chosen by each annotator.
+            Questions are only meaningful within their paper ("what dataset do they use?"),
+            so each is searched within its paper. Papers come as the dataset's own parsed
+            text, so this scores chunking and retrieval, not PDF parsing.
+            This is NOT the official protocol (qasper_evaluator.py: the model reads the whole
+            paper and predicts an answer plus an evidence set, scored by Answer F1 and Evidence
+            F1, each the max over annotators). Differences: recall@k instead of set F1; each
+            metric takes its own best annotator; unanswerable annotators of answerable questions,
+            bare section-name evidence, and questions with no usable evidence are dropped;
+            "FLOAT SELECTED:" evidence matches the caption text.
+  qasper_lib  The same questions over the whole 416-paper library, unfiltered, with the paper's
+            title prepended ('In the paper "<title>": <question>') so each one is unambiguous.
+            A hit needs the right paper and the right paragraph.
+  qasper_test, qasper_lib_test  The same on the test split. Its README asks that it be used
+            only to evaluate a finished system, so iterate on dev.
 
 Each dataset gets its own Postgres schema (bench_<name>). Questions go through POST /search as in
 evals.run. Documents are chunked, embedded and stored with the app's own functions, but in
@@ -55,6 +71,9 @@ class BenchItem:
     question: str
     type: str
     units: list[str]  # gold documents (keys into docs) or quotes; empty = no answer in the corpus
+    answer: str | None = None  # short reference answer, where the dataset has one
+    scope: str | None = None  # search only this document (a key into docs); None = everything
+    unit_sets: list[list[str]] | None = None  # alternative gold sets (one per annotator); best counts
 
 
 @dataclass
@@ -76,7 +95,30 @@ def download() -> None:
     hf_hub_download("BeIR/fiqa-qrels", "test.tsv", repo_type="dataset", local_dir=DATA_DIR / "fiqa")
     snapshot_download("galileo-ai/ragbench", repo_type="dataset", local_dir=DATA_DIR / "techqa",
                       allow_patterns=["techqa/*"])
+    _download_qasper()
     print(f"downloaded to {DATA_DIR}")
+
+
+QASPER_URL = "https://qasper-dataset.s3.us-west-2.amazonaws.com/"
+QASPER_FILES = {"qasper-train-dev-v0.3.tgz": ["qasper-dev-v0.3.json"],
+                "qasper-test-and-evaluator-v0.3.tgz": ["qasper-test-v0.3.json", "qasper_evaluator.py"]}
+
+
+def _download_qasper() -> None:
+    import io
+    import tarfile
+
+    target = DATA_DIR / "qasper"
+    target.mkdir(parents=True, exist_ok=True)
+    for archive, names in QASPER_FILES.items():
+        data = httpx.get(QASPER_URL + archive, timeout=300, follow_redirects=True).raise_for_status().content
+        with tarfile.open(fileobj=io.BytesIO(data)) as tar:
+            for name in names:
+                (target / name).write_bytes(tar.extractfile(tar.getmember(name)).read())
+
+
+def qasper_papers(split: str) -> dict:
+    return json.loads((DATA_DIR / f"qasper/qasper-{split}-v0.3.json").read_text(encoding="utf-8"))
 
 
 def _parquet(pattern: str) -> list[dict]:
@@ -92,7 +134,7 @@ def load_hotpot() -> Benchmark:
         for title, sentences in zip(row["context"]["title"], row["context"]["sentences"], strict=True):
             docs.setdefault(title, f"# {title}\n\n{''.join(sentences)}")
         items.append(BenchItem(row["id"], row["question"], row["type"],
-                               sorted(set(row["supporting_facts"]["title"]))))
+                               sorted(set(row["supporting_facts"]["title"])), row["answer"]))
     return Benchmark(docs, items, "doc")
 
 
@@ -101,7 +143,7 @@ def load_multihop() -> Benchmark:
     docs = {c["url"]: f"# {c['title']}\n\n{c['body']}" for c in corpus}
     queries = json.loads((DATA_DIR / "multihop/MultiHopRAG.json").read_text(encoding="utf-8"))
     items = [BenchItem(f"mh{i}", q["query"], q["question_type"],
-                       sorted({e["fact"] for e in q["evidence_list"]}))
+                       sorted({e["fact"] for e in q["evidence_list"]}), q["answer"])
              for i, q in enumerate(queries)]
     return Benchmark(docs, items, "quote")
 
@@ -136,7 +178,63 @@ def load_techqa() -> Benchmark:
     return Benchmark(docs, items, "doc")
 
 
-LOADERS = {"hotpot": load_hotpot, "multihop": load_multihop, "fiqa": load_fiqa, "techqa": load_techqa}
+FLOAT_PREFIX = "FLOAT SELECTED: "
+
+
+def qasper_markdown(paper: dict) -> str:
+    """One paper as Markdown. Nested sections arrive as "Model ::: Response Generation"."""
+    parts = [f"# {paper['title']}", "## Abstract", paper["abstract"].strip()]
+    for section in paper["full_text"]:
+        name = [x.strip() for x in (section["section_name"] or "").split(":::") if x.strip()]
+        if name:
+            parts.append(f"{'#' * min(len(name) + 1, 6)} {name[-1]}")
+        parts += [x.strip() for x in section["paragraphs"] if x.strip()]
+    captions = [f["caption"].strip() for f in paper["figures_and_tables"] if f["caption"].strip()]
+    if captions:
+        parts += ["## Figures and tables", *captions]
+    return "\n\n".join(parts)
+
+
+def qasper_items(paper_id: str, paper: dict) -> list[BenchItem]:
+    """Null query when every annotator said unanswerable. Some evidence is a bare section name
+    (the whole section); a quote can't score that, so it is dropped. Annotators left with no
+    evidence are left out, and a question with no evidence at all is dropped."""
+    sections = {s["section_name"].strip() for s in paper["full_text"] if s["section_name"]}
+    items = []
+    for q in paper["qas"]:
+        answers = [a["answer"] for a in q["answers"]]
+        sets = [sorted({e.removeprefix(FLOAT_PREFIX).strip() for e in a["evidence"]} - sections - {""})
+                for a in answers if not a["unanswerable"]]
+        sets = [u for u in sets if u]
+        if all(a["unanswerable"] for a in answers):
+            kind = "unanswerable"
+        elif not sets:
+            continue
+        else:
+            kinds = {("yes_no" if a["yes_no"] is not None else "extractive" if a["extractive_spans"]
+                      else "abstractive") for a in answers if not a["unanswerable"]}
+            kind = kinds.pop() if len(kinds) == 1 else "mixed"
+        units = sorted({u for s in sets for u in s})
+        items.append(BenchItem(q["question_id"], q["question"], kind, units, scope=paper_id,
+                               unit_sets=sets or None))
+    return items
+
+
+def load_qasper(split: str = "dev", library: bool = False) -> Benchmark:
+    papers = qasper_papers(split)
+    docs = {pid: qasper_markdown(p) for pid, p in papers.items()}
+    items = [i for pid, p in papers.items() for i in qasper_items(pid, p)]
+    if library:
+        for i in items:
+            i.question = f'In the paper "{papers[i.scope]["title"].strip()}": {i.question}'
+            i.scope = None
+    return Benchmark(docs, items, "quote")
+
+
+LOADERS = {"hotpot": load_hotpot, "multihop": load_multihop, "fiqa": load_fiqa, "techqa": load_techqa,
+           "qasper": load_qasper, "qasper_lib": lambda: load_qasper(library=True),
+           "qasper_test": lambda: load_qasper("test"),
+           "qasper_lib_test": lambda: load_qasper("test", library=True)}
 
 
 async def ingest(app, settings: Settings, docs: dict[str, str]) -> dict[str, int]:
@@ -165,6 +263,14 @@ async def ingest(app, settings: Settings, docs: dict[str, str]) -> dict[str, int
     return ids
 
 
+async def existing_doc_ids(app, bench: Benchmark) -> dict[str, int]:
+    """Document key -> id for a schema ingested earlier (ingest stores the key as the title)."""
+    async with app.state.pool.connection() as conn:
+        rows = await (await conn.execute("SELECT id, title FROM documents")).fetchall()
+    by_title = {r["title"]: r["id"] for r in rows}
+    return {k: by_title[k] for k in bench.docs if k in by_title}
+
+
 def unit_ranks(ranked: list[dict], units: list[str], kind: str, doc_ids: dict[str, int]) -> list[int | None]:
     """1-based rank of the first chunk satisfying each gold unit (None if not retrieved)."""
     def hit(chunk: dict, unit: str) -> bool:
@@ -188,6 +294,13 @@ def score_ranks(ranks: list[int | None]) -> dict[str, float]:
     return out
 
 
+def best_scores(ranked: list[dict], item: BenchItem, kind: str, doc_ids: dict[str, int]) -> dict[str, float]:
+    """Scores against each alternative gold set, keeping the best value of every metric."""
+    scores = [score_ranks(unit_ranks(ranked, units, kind, doc_ids))
+              for units in (item.unit_sets or [item.units])]
+    return {m: max(s[m] for s in scores) for m in scores[0]}
+
+
 def auc(positives: list[float], negatives: list[float]) -> float | None:
     if not positives or not negatives:
         return None
@@ -207,8 +320,10 @@ async def eval_variant(client, bench: Benchmark, doc_ids, items, mode, reranker,
     async def one(item: BenchItem) -> dict:
         async with sem:
             started = time.perf_counter()
-            resp = await client.post("/search", json={"query": item.question[:8000], "top_k": top_k,
-                                                      "mode": mode, "reranker": reranker})
+            body = {"query": item.question[:8000], "top_k": top_k, "mode": mode, "reranker": reranker}
+            if item.scope is not None:
+                body["document_ids"] = [doc_ids[item.scope]]
+            resp = await client.post("/search", json=body)
             latency = (time.perf_counter() - started) * 1000
         resp.raise_for_status()
         ranked = resp.json()
@@ -216,9 +331,11 @@ async def eval_variant(client, bench: Benchmark, doc_ids, items, mode, reranker,
                "context_tokens@5": sum(approx_tokens(c["text"]) for c in ranked[:5]),
                "top1": ranked[0]["score"] if ranked else None, "n": len(ranked)}
         if item.units:
-            row.update(score_ranks(unit_ranks(ranked, item.units, bench.unit_kind, doc_ids)))
+            row.update(best_scores(ranked, item, bench.unit_kind, doc_ids))
         return row
 
+    # A scoped question whose document produced no chunks has nothing to search.
+    items = [i for i in items if i.scope is None or i.scope in doc_ids]
     rows = await asyncio.gather(*(one(i) for i in items))
     gold = [r for r in rows if "mrr@10" in r]
     summary = {m: mean_or_none([r[m] for r in gold])
@@ -258,10 +375,7 @@ async def run_dataset(name: str, args) -> dict:
            "unreachable_quotes": unreachable_quotes(bench, settings), "variants": {}}
     async with app.router.lifespan_context(app):
         if args.reuse:
-            async with app.state.pool.connection() as conn:
-                rows = await (await conn.execute("SELECT id, title FROM documents")).fetchall()
-            by_title = {r["title"]: r["id"] for r in rows}  # ingest stores the key as the title
-            doc_ids = {k: by_title[k] for k in bench.docs if k in by_title}
+            doc_ids = await existing_doc_ids(app, bench)
         else:
             doc_ids = await ingest(app, settings, bench.docs)
         async with app.state.pool.connection() as conn:
@@ -335,7 +449,7 @@ def main() -> None:
     sub = p.add_subparsers(dest="command", required=True)
     sub.add_parser("download")
     r = sub.add_parser("run")
-    r.add_argument("--datasets", default="hotpot,multihop,fiqa,techqa")
+    r.add_argument("--datasets", default="hotpot,multihop,fiqa,techqa,qasper,qasper_lib")
     r.add_argument("--modes", default="vector,fts,hybrid")
     r.add_argument("--rerankers", default="none", help="comma list, e.g. none,cohere")
     r.add_argument("--limit", type=int, default=1000, help="sample at most N questions per dataset")

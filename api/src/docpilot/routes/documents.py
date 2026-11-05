@@ -55,12 +55,14 @@ class SearchRequest(BaseModel):
     top_k: int = Field(5, ge=1, le=50)
     mode: RetrievalMode | None = None
     reranker: RerankerName | None = None
+    document_ids: list[int] | None = Field(None, min_length=1, max_length=100)
 
 
 @router.post("/search", dependencies=[Depends(rate_limit("search"))])
 async def search(request: Request, body: SearchRequest) -> list[dict]:
     """Retrieval only, no LLM. The eval suite uses this to score recall@k and MRR."""
     chunks = await request.app.state.retriever.search(
-        body.query, top_k=body.top_k, mode=body.mode, reranker=body.reranker
+        body.query, top_k=body.top_k, mode=body.mode, reranker=body.reranker,
+        document_ids=body.document_ids,
     )
     return [c.to_dict() for c in chunks]

@@ -45,6 +45,8 @@ class UIMessage(BaseModel):
 class RetrievalOptions(BaseModel):
     mode: RetrievalMode | None = None
     reranker: RerankerName | None = None
+    # Chat with these documents only: search_docs and read_doc see nothing else.
+    document_ids: list[int] | None = Field(None, min_length=1, max_length=100)
 
 
 class ChatRequest(BaseModel):
@@ -76,12 +78,17 @@ async def chat(request: Request, body: ChatRequest) -> StreamingResponse:
     shown_earlier = await store.retrieved_chunk_ids(s.pool, body.id)
     history = recent_history(history, s.settings.max_history_messages)
 
+    scope = body.retrieval.document_ids
+
     async def search(query: str, top_k: int):
         return await s.retriever.search(
-            query, top_k=top_k, mode=body.retrieval.mode, reranker=body.retrieval.reranker
+            query, top_k=top_k, mode=body.retrieval.mode, reranker=body.retrieval.reranker,
+            document_ids=scope,
         )
 
     async def read_document(doc_id: int):
+        if scope is not None and doc_id not in scope:
+            return None  # outside the chat's documents: same answer as a missing one
         return await store.get_document(s.pool, doc_id)
 
     async def create_page(title: str, markdown: str) -> int:

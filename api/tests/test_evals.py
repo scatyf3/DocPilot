@@ -5,7 +5,24 @@ from pathlib import Path
 
 import pytest
 
-from evals.benchmarks import auc, score_ranks, unit_ranks
+from evals.bench_matrix import (
+    ALL_COMBOS,
+    answer_matches,
+    cited_gold,
+    matrix_markdown,
+    normalize_answer,
+    parse_combo,
+    summarize,
+)
+from evals.benchmarks import (
+    BenchItem,
+    auc,
+    best_scores,
+    qasper_items,
+    qasper_markdown,
+    score_ranks,
+    unit_ranks,
+)
 from evals.compare import compare
 from evals.dataset import Evidence, Item, load_dataset, validate
 from evals.metrics import contains, recall_at_k, reciprocal_rank
@@ -159,3 +176,176 @@ def test_auc():
     assert auc([2.0, 3.0], [1.0]) == 1.0
     assert auc([1.0], [1.0]) == 0.5
     assert auc([], [1.0]) is None
+
+
+def test_normalize_answer_drops_citations_punctuation_and_articles():
+    assert normalize_answer("The answer is Sam Bankman-Fried [c:12].") == "answer is sam bankman fried"
+
+
+def test_answer_matches():
+    assert answer_matches("It was Sam Bankman-Fried [c:3].", "Sam Bankman-Fried")
+    assert not answer_matches("Samuel Bankman", "Sam Bankman-Fried")
+    assert not answer_matches("Googleplex", "Google")  # whole tokens only
+    assert answer_matches("Yes. Both reports say so [c:1], no doubt.", "Yes")
+    assert not answer_matches("No, the second article disagrees. Yes, the first agrees.", "Yes")
+    assert not answer_matches("anything", "")
+
+
+def test_cited_gold_by_document_and_by_quote():
+    doc_item = BenchItem("h1", "?", "bridge", ["Paris", "Lyon"], "x")
+    assert cited_gold([{"title": "Lyon", "text": ""}], doc_item, "doc")
+    assert not cited_gold([{"title": "Nice", "text": "Paris"}], doc_item, "doc")
+    quote_item = BenchItem("m1", "?", "inference_query", ["the fine was  $4 billion"], "x")
+    assert cited_gold([{"title": "u", "text": "Reports say The fine was $4 billion."}], quote_item, "quote")
+
+
+def test_bench_answer_summary():
+    def row(type_, answerable, refused, correct, reference="x", cited=True, tools=("search_docs",)):
+        return {"type": type_, "answerable": answerable, "refused": refused, "correct": correct,
+                "reference": reference, "cited_gold": cited if answerable else None, "error": None,
+                "finish_reason": "stop", "tool_calls": list(tools), "ungrounded": False,
+                "latency_ms": 10, "cost_usd": 0.0}
+
+    s = summarize([row("comparison_query", True, False, True, "Yes"),
+                   row("inference_query", True, False, False, "Google", cited=False),
+                   row("inference_query", True, True, False, "Google", cited=False, tools=()),
+                   row("null_query", False, True, True), row("null_query", False, False, False)])
+    assert s["accuracy"] == pytest.approx(1 / 3, abs=1e-4)
+    assert s["accuracy_by_type"] == {"comparison_query": 1.0, "inference_query": 0.0}
+    assert s["always_yes_accuracy"] == pytest.approx(1 / 3, abs=1e-4)
+    assert s["refusal_accuracy"] == 0.5 and s["false_refusal_rate"] == pytest.approx(1 / 3, abs=1e-4)
+    assert s["cited_gold_rate"] == 0.5  # refused answers are not "attempted"
+    assert s["no_search_rate"] == 0.2 and s["n_null"] == 2
+
+
+def test_matrix_combos():
+    assert ALL_COMBOS == ["vector", "fts", "hybrid", "vector+cohere", "fts+cohere", "hybrid+cohere"]
+    assert parse_combo("hybrid") == ("hybrid", "none")
+    assert parse_combo("fts+cohere") == ("fts", "cohere")
+    with pytest.raises(ValueError):
+        parse_combo("bm25")
+
+
+def test_matrix_markdown_tables_pending_cells_and_paired_diffs():
+    def cell(combo, correct, recall):
+        items = [{"id": f"q{i}", "answerable": True, "correct": c} for i, c in enumerate(correct)]
+        retrieval = [{"id": f"q{i}", "recall@5": r} for i, r in enumerate(recall)]
+        return {"dataset": "hotpot", "combo": combo,
+                "n_questions": 4, "n_docs": 9, "top_k": 5, "seed": 0, "llm": "qwen3",
+                "embedder": "bge-m3", "rerank_model": "bge-reranker", "elapsed_s": 120,
+                "retrieval": {"summary": {"recall@1": 0.25, "recall@5": sum(recall) / 4,
+                                          "complete@5": 0.5, "mrr@10": 0.4,
+                                          "latency_ms_p50": 30, "latency_ms_p95": 60},
+                              "items": retrieval},
+                "answers": {"summary": {"accuracy": sum(correct) / 4, "cited_gold_rate": 0.5,
+                                        "refusal_accuracy": None, "false_refusal_rate": 0.0,
+                                        "latency_ms_p50": 4200, "latency_ms_p95": 9000,
+                                        "errors": 0, "always_yes_accuracy": 0.25},
+                            "items": items}}
+
+    md = matrix_markdown([cell("hybrid", [1, 1, 0, 0], [1, 1, 0, 0]),
+                          cell("vector", [1, 1, 1, 1], [1, 1, 1, 0])])
+    assert "**hotpot**: 4 questions, 9 docs" in md
+    assert "| vector | 0.250 | 0.750 | 0.500 | 0.400 | 30 / 60 | 1.000 |" in md
+    assert "| 4.2 / 9.0 | 0 | 2 |" in md
+    assert "| fts+cohere | (pending) |" in md
+    assert md.index("| vector |") < md.index("| hybrid |")  # rows keep ALL_COMBOS order
+    assert "- vector - hybrid: answer acc +0.500" in md and "recall@5 +0.250" in md
+    assert "scored 0.250" not in md and "would score 0.250" in md
+    assert "closed-book" not in md  # optional row stays hidden until it has run
+
+    closed = cell("closed-book", [1, 0, 0, 0], [0, 0, 0, 0]) | {"retrieval": None, "n_docs": 0}
+    md = matrix_markdown([cell("hybrid", [1, 1, 0, 0], [1, 1, 0, 0]), closed])
+    assert "**hotpot**: 4 questions, 9 docs" in md  # doc count from the open-book cell
+    assert "| closed-book | - | - | - | - | - | 0.250 |" in md
+    assert "- closed-book - hybrid: answer acc -0.250 [" in md
+    assert matrix_markdown([]) == "No finished cells yet.\n"
+
+
+QASPER_PAPER = {
+    "title": "A Paper", "abstract": "We study things.",
+    "full_text": [{"section_name": "Introduction", "paragraphs": ["Intro text.", " "]},
+                  {"section_name": "Model ::: Encoder", "paragraphs": ["The encoder is a BiLSTM."]},
+                  {"section_name": None, "paragraphs": ["Orphan paragraph."]}],
+    "figures_and_tables": [{"file": "1-Table1-1.png", "caption": "Table 1: Results on SQuAD."}],
+    "qas": [
+        {"question_id": "q1", "question": "What encoder?", "answers": [
+            {"answer": {"unanswerable": False, "extractive_spans": ["BiLSTM"], "yes_no": None,
+                        "free_form_answer": "", "evidence": ["The encoder is a BiLSTM."]}},
+            {"answer": {"unanswerable": False, "extractive_spans": [], "yes_no": None,
+                        "free_form_answer": "a BiLSTM",
+                        "evidence": ["FLOAT SELECTED: Table 1: Results on SQuAD.", "Model ::: Encoder"]}}]},
+        {"question_id": "q2", "question": "Any code?", "answers": [
+            {"answer": {"unanswerable": True, "extractive_spans": [], "yes_no": None,
+                        "free_form_answer": "", "evidence": []}}]},
+        {"question_id": "q3", "question": "Is it good?", "answers": [
+            {"answer": {"unanswerable": False, "extractive_spans": [], "yes_no": True,
+                        "free_form_answer": "", "evidence": ["Model ::: Encoder"]}}]},
+    ],
+}
+
+
+def test_qasper_markdown_keeps_section_nesting_and_captions():
+    md = qasper_markdown(QASPER_PAPER)
+    assert md.startswith("# A Paper\n\n## Abstract\n\nWe study things.\n\n## Introduction\n\nIntro text.")
+    assert "### Encoder\n\nThe encoder is a BiLSTM." in md
+    assert "Orphan paragraph." in md
+    assert md.endswith("## Figures and tables\n\nTable 1: Results on SQuAD.")
+
+
+def test_qasper_items_gold_sets():
+    q1, q2 = qasper_items("p1", QASPER_PAPER)  # q3's only evidence is a section name: dropped
+    assert (q1.type, q1.scope) == ("mixed", "p1")
+    assert q1.unit_sets == [["The encoder is a BiLSTM."], ["Table 1: Results on SQuAD."]]
+    assert q1.units == ["Table 1: Results on SQuAD.", "The encoder is a BiLSTM."]
+    assert (q2.type, q2.units, q2.unit_sets) == ("unanswerable", [], None)
+
+
+def test_best_scores_takes_the_best_annotator_per_metric():
+    item = BenchItem("q", "?", "x", ["a", "b", "c"], unit_sets=[["a", "b"], ["c"]])
+    ranked = [{"text": "c"}, {"text": "zz"}, {"text": "a"}]
+    s = best_scores(ranked, item, "quote", {})
+    assert s["recall@1"] == 1.0  # annotator 2's only paragraph is first
+    assert s["recall@5"] == 1.0 and s["mrr@10"] == 1.0
+    assert best_scores(ranked, BenchItem("q", "?", "x", ["a", "b"]), "quote", {})["recall@5"] == 0.5
+
+
+def test_qasper_library_variant_names_the_paper_and_drops_the_scope(monkeypatch, tmp_path):
+    import evals.benchmarks as bm
+
+    (tmp_path / "qasper").mkdir()
+    (tmp_path / "qasper/qasper-dev-v0.3.json").write_text(json.dumps({"p1": QASPER_PAPER}))
+    monkeypatch.setattr(bm, "DATA_DIR", tmp_path)
+    scoped, library = bm.load_qasper(), bm.load_qasper(library=True)
+    assert scoped.items[0].scope == "p1" and scoped.items[0].question == "What encoder?"
+    assert library.items[0].scope is None
+    assert library.items[0].question == 'In the paper "A Paper": What encoder?'
+    assert library.items[0].unit_sets == scoped.items[0].unit_sets
+
+
+def test_qasper_prediction_from_an_agent_turn():
+    from docpilot.agent.prompts import REFUSAL
+    from evals.qasper_official import chunk_units, paper_units, predict
+
+    units = paper_units(QASPER_PAPER)
+    first = ("# A Paper\n\n## Abstract\n\nWe study things.\n\n## Introduction\n\nIntro text.\n\n"
+             "### Encoder\n\nThe encoder")
+    assert chunk_units(first, units) == ["Intro text.", "The encoder is a BiLSTM."]  # a fragment counts
+    figures = "## Figures and tables\n\nTable 1: Results on SQuAD."
+    assert chunk_units(figures, units) == ["FLOAT SELECTED: Table 1: Results on SQuAD."]
+
+    turn = {"question_id": "q1", "error": None,
+            "answer": "A BiLSTM encoder [c:1]. It wins on SQuAD [c:2]. Also [c:7].",
+            "citations": [{"id": 1, "text": first}, {"id": 2, "text": figures}]}
+    chunk, cited = predict(turn, units)["chunk"], predict(turn, units)["cited"]
+    assert chunk["predicted_answer"] == "A BiLSTM encoder . It wins on SQuAD . Also ."
+    assert chunk["predicted_evidence"] == ["Intro text.", "The encoder is a BiLSTM.",
+                                           "FLOAT SELECTED: Table 1: Results on SQuAD."]
+    # Per citation, only the paragraph closest to its claim; the unresolved [c:7] adds nothing.
+    assert cited["predicted_evidence"] == ["The encoder is a BiLSTM.",
+                                           "FLOAT SELECTED: Table 1: Results on SQuAD."]
+
+    refused = predict(turn | {"answer": REFUSAL, "citations": []}, units)["chunk"]
+    assert (refused["predicted_answer"], refused["predicted_evidence"]) == ("Unanswerable", [])
+    failed = predict(turn | {"error": "boom", "answer": ""}, units)["cited"]
+    assert (failed["predicted_answer"], failed["predicted_evidence"]) == ("", [])

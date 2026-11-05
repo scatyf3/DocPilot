@@ -161,6 +161,14 @@ What this changed:
 - Full-text search originally ranked with Postgres's `ts_rank_cd`, which has no inverse document frequency. It scored 0.061 on FiQA and pulled hybrid below vector-only on three of the four datasets. The 14-doc wiki couldn't show this. BM25 scores 0.228, close to the published baseline of about 0.25.
 - Chunks stay at 500 tokens: 300 tokens looked equally good on the wiki but significantly lowered recall@5 on MultiHop-RAG (-0.062, 95% CI -0.077 to -0.047).
 
+### Public answer benchmarks
+
+HotpotQA and MultiHop-RAG also ship short reference answers, so `evals/bench_matrix.py` runs the agent end to end over the schemas ingested above. It crosses each dataset with all six retrieval settings: vector, BM25 (`fts`) or hybrid, each with and without the reranker. Every setting answers the same seeded sample of questions, and the script writes one table per dataset with retrieval recall, answer accuracy and latency, plus paired confidence intervals against plain hybrid. Answers are scored by matching the normalized reference answer, with no LLM judge. Add `closed-book` to `--combos` to also run the agent over an empty library, which shows how much the model answers from memory.
+
+```bash
+python -m evals.bench_matrix --llm openai --out evals/results/matrix   # rerun the same --out to resume
+```
+
 `evals/baseline.json` was produced offline with the **fake embedder** (retrieval only). After the first real run, regenerate it with `python -m evals.run --output evals/baseline.json` and commit it.
 
 ### Results: TO FILL after first real run

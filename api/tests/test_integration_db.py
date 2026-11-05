@@ -225,3 +225,52 @@ async def test_full_text_survives_awkward_queries(client: httpx.AsyncClient, que
     await client.post("/documents", files={"file": ("a.md", b"# A\n\nback\\slash o'neil words here")})
     for mode in ("fts", "hybrid"):
         assert (await client.post("/search", json={"query": query, "mode": mode})).status_code == 200
+
+
+async def test_search_limited_to_documents(client: httpx.AsyncClient):
+    ids = []
+    for i in range(3):
+        body = f"# Paper {i}\n\nWe train the model on dataset number {i} and report accuracy."
+        resp = await client.post("/documents", files={"file": (f"p{i}.md", body.encode())})
+        ids.append(resp.json()["id"])
+    for mode in ("vector", "fts", "hybrid"):
+        hits = (await client.post("/search", json={
+            "query": "what dataset do they train on", "mode": mode, "document_ids": [ids[1]]})).json()
+        assert hits and {h["document_id"] for h in hits} == {ids[1]}, mode
+    assert (await client.post("/search", json={"query": "x", "document_ids": []})).status_code == 422
+
+
+class ScriptedToolsProvider(CitingProvider):
+    """Makes the given tool calls in its first turn, then answers."""
+
+    def __init__(self, calls):
+        super().__init__("done")
+        self.calls = calls
+
+    async def stream_turn(self, system, messages, tools, *, allow_tools=True):
+        if messages[-1]["role"] == "user":
+            messages.append({"role": "assistant", "tool_calls": self.calls})
+            yield TurnResult("", self.calls, "tool_use", 1, 1)
+            return
+        yield TextDelta(self.answer)
+        yield TurnResult(self.answer, [], "end", 1, 1)
+
+
+async def test_chat_limited_to_documents(client: httpx.AsyncClient):
+    ids = []
+    for name in ("leave", "cafeteria"):
+        body = f"# {name}\n\nThe {name} policy covers parental leave and lunch.".encode()
+        ids.append((await client.post("/documents", files={"file": (f"{name}.md", body)})).json()["id"])
+    client._transport.app.state.llm = ScriptedToolsProvider([
+        ToolCall("c1", "search_docs", {"query": "parental leave lunch policy", "top_k": 5}),
+        ToolCall("c2", "read_doc", {"document_id": ids[1]}),
+    ])
+    resp = await client.post("/chat", json={
+        "id": "scoped", "messages": [{"role": "user", "parts": [{"type": "text", "text": "q"}]}],
+        "retrieval": {"mode": "hybrid", "document_ids": [ids[0]]}})
+    chunks = [json.loads(e[6:]) for e in resp.text.split("\n\n") if e.startswith("data: {")]
+    trace = next(x["data"] for x in chunks if x["type"] == "data-trace")
+    search, read = trace["tool_calls"]
+    stored = (await client.get(f"/documents/{ids[0]}")).json()
+    assert set(trace["retrieved_chunk_ids"]) == {c["id"] for c in stored["chunks"]}
+    assert "error" in read["summary"]  # the other document is out of scope

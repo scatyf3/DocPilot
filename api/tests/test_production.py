@@ -271,10 +271,10 @@ class FlakyRetriever(Retriever):
             raise outcome
         return outcome
 
-    async def _vector(self, query, limit):
+    async def _vector(self, query, limit, document_ids=None):
         return await self._run("vector")
 
-    async def _fts(self, query, limit):
+    async def _fts(self, query, limit, document_ids=None):
         return await self._run("fts")
 
 
