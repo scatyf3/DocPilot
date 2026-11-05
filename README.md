@@ -8,7 +8,8 @@ answer quality on every PR.
 - **Agentic RAG:** the model decides when to call `search_docs`, `read_doc` and `create_page`. Search is not hard-wired into every turn.
 - **Hybrid retrieval:** Postgres full-text and pgvector results are fused with reciprocal rank fusion (RRF), then optionally reranked. The retrieval mode is a flag, so ablations are one command.
 - **Streaming with inline citations:** FastAPI emits the Vercel AI SDK UI message stream, and the Next.js `useChat` renders `[c:<id>]` markers as clickable chips.
-- **One Postgres holds everything:** documents, chunks, vectors, conversations and traces.
+- **Multi-tenant, enforced twice:** every query filters by tenant, and Postgres row-level security enforces the same rule, so tenant A can never retrieve tenant B's chunks, even through the agent's tools or a forged citation. Accounts use argon2id passwords, 15-minute JWT access tokens and single-use refresh tokens that detect replay. See [docs/backend.md](docs/backend.md).
+- **One Postgres holds everything:** documents, chunks, vectors, conversations, traces and ingest jobs. Redis holds only what can be lost: shared rate limits, per-tenant caches, and wake-up messages for the ingest worker.
 - **Evals in CI:** 110 labeled questions over a fixed corpus. The workflow reports recall@5, MRR, LLM-judged correctness, citation faithfulness and refusals, and posts the diff against a baseline as a PR comment.
 
 ## Architecture
@@ -23,17 +24,22 @@ flowchart LR
         Agent["agent loop<br/>search_docs / read_doc / create_page"]
         LLM["LLM provider<br/>Anthropic | OpenAI-compatible | fake"]
         Ret["retriever<br/>vector + FTS -> RRF -> rerank"]
-        Ing["ingest<br/>parse -> chunk -> embed"]
+        Up["POST /documents<br/>202 + job id"]
+        Auth["auth + rate limits<br/>JWT or API key -> tenant"]
     end
-    PG[("Postgres + pgvector<br/>documents, chunks (tsv, vector)<br/>conversations, messages, traces")]
+    Worker["docpilot worker (arq)<br/>parse -> chunk -> embed"]
+    PG[("Postgres + pgvector, row-level security<br/>tenants, users, documents, chunks<br/>conversations, traces, ingest_jobs")]
+    Redis[("Redis<br/>rate-limit buckets, caches,<br/>job wake-ups")]
     Evals["evals/ runner<br/>(CI + local)"]
 
-    UI -->|POST /chat| Chat --> Agent
+    UI -->|POST /chat| Auth --> Chat --> Agent
     Agent <--> LLM
-    Agent -->|tools| Ret --> PG
-    Agent -->|create_page| Ing --> PG
+    Agent -->|tools, tenant-scoped| Ret --> PG
+    Ret <-->|per-tenant cache| Redis
+    Auth <--> Redis
     Chat -->|message + trace| PG
-    UI -->|upload| Ing
+    UI -->|upload, then poll /jobs/id| Up -->|file| PG
+    Up -->|job id| Redis --> Worker -->|chunks| PG
     Evals -->|same /search and /chat, in-process| Chat
 ```
 
@@ -47,8 +53,10 @@ flowchart LR
 
 ```bash
 cp .env.example .env            # add ANTHROPIC_API_KEY + OPENAI_API_KEY (embeddings)
-docker compose up --build       # web :3000, api :8000, postgres :5432
+docker compose up --build       # web :3000, api :8000, postgres :5432, redis, ingest worker
 ```
+
+Compose runs the API with two processes and `INGEST_MODE=queue`: uploads return at once and the worker indexes them while the Library page shows progress. To enable user accounts, set `JWT_SECRETS` in `.env`; then `POST /auth/register` creates a user with their own tenant.
 
 No keys? Set `LLM_PROVIDER=fake` and `EMBEDDING_PROVIDER=fake` in `.env`. The whole app then runs offline with a scripted model and a hashed bag-of-words embedder.
 
@@ -68,6 +76,8 @@ docpilot db init                                         # idempotent: extension
 docpilot ingest ../evals/corpus                          # optional sample docs
 uvicorn docpilot.app:app --reload --port 8000
 # Windows without --reload: add  --loop asyncio:SelectorEventLoop  (psycopg async needs it)
+# Optional, with REDIS_URL set: shared rate limits, caches, and the ingest queue
+INGEST_MODE=queue docpilot worker                        # alongside an API with INGEST_MODE=queue
 
 # Web
 cd web
@@ -76,7 +86,8 @@ API_URL=http://localhost:8000 npm run dev                 # http://localhost:300
 
 # Tests
 cd api && pytest                       # unit tests need no DB and no keys
-DATABASE_URL=postgresql://... pytest   # also runs the DB-backed end-to-end test
+DATABASE_URL=postgresql://... pytest   # + DB-backed tests: tenant isolation, RLS, auth, jobs
+REDIS_URL=redis://localhost:6379/15 DATABASE_URL=... pytest   # + Redis: limits, caches, worker (flushes db 15)
 ```
 
 API dependencies are pinned in `api/requirements.txt`, which the Docker image installs. After changing `pyproject.toml`, regenerate it:
@@ -189,8 +200,11 @@ python -m evals.bench_matrix --llm openai --out evals/results/matrix   # rerun t
 
 ## Production notes
 
-- **Access:** the API requires a key from `API_KEYS` when `ENVIRONMENT=production`. Browsers go through the web app's server-side proxy (`web/src/app/api/backend`), which adds the key, and `WEB_PASSWORD` puts Basic Auth on the site. There are no user accounts: everyone who gets in shares one library, so this is not yet safe for mutually untrusting users.
-- **Rate limits:** per client and per instance, kept in memory, so N instances allow N times the limit. Web traffic counts as one client unless you set `TRUST_FORWARDED_FOR=true` on the web app and `CLIENT_IP_HEADER=x-client-ip` on the API. Only do that behind a platform that overwrites `x-forwarded-for` (Vercel does), because Next.js otherwise passes on whatever the client sent.
+- **Access:** in production the API needs `API_KEYS`, `JWT_SECRETS` or both. A user's access token scopes every request to their tenant. An API key acts on tenant 1, and the web app's server-side proxy (`web/src/app/api/backend`) uses one, so the web UI currently shows tenant 1's library. `WEB_PASSWORD` puts Basic Auth on the site. A login screen in the web app is not built yet; the API's account endpoints are.
+- **Tenant isolation:** the app's database connections run as `DB_APP_ROLE` (created by `docpilot db init`, which needs `CREATEROLE`), so row-level security applies to them. On a host where you can't create roles, set `DB_APP_ROLE=` to rely on the query filters alone. Details and the threat model: [docs/backend.md](docs/backend.md).
+- **Rate limits:** per user (token) or per client IP, shared by all instances through Redis. Without `REDIS_URL`, or while Redis is down, each instance keeps its own buckets, so N instances allow N times the limit. Web traffic counts as one client unless you set `TRUST_FORWARDED_FOR=true` on the web app and `CLIENT_IP_HEADER=x-client-ip` on the API. Only do that behind a platform that overwrites `x-forwarded-for` (Vercel does), because Next.js otherwise passes on whatever the client sent.
+- **Load:** with fake models, on a busy shared 40-thread machine, 50 closed-loop users got 452 req/s (search p95 160 ms, full chat stream p95 100 ms, 0 errors), and the per-tenant cache added 35% throughput. 200 users with think time saw search p95 93 ms. Method, caveats and what the runs taught: [docs/backend.md](docs/backend.md#load-test).
+- **Ingest:** with `INGEST_MODE=queue`, uploads are stored in Postgres and indexed by `docpilot worker`. Redis only carries wake-ups, so losing it delays jobs but doesn't lose them.
 - **Failures:** if embeddings or the reranker are down, retrieval degrades to what still works. A chat turn stops at `CHAT_TIMEOUT_SECONDS`. Clients get a request id, and details stay in the logs.
 - **Untrusted documents:** text from documents can't forge chunk boundaries, citations must point at chunks the model was shown, and answers with no valid citation are flagged in the UI. This limits prompt injection but does not prevent it: a document can still influence what the model writes.
 - **Schema changes:** add a numbered file to `api/src/docpilot/migrations/` and never edit an applied one. `docpilot db init` applies pending files in order. Migrations only go forward, so write a new one to undo a change.
@@ -199,8 +213,8 @@ python -m evals.bench_matrix --llm openai --out evals/results/matrix   # rerun t
 
 **API on Fly.io** (`api/fly.toml`):
 1. Run `fly launch --no-deploy` from `api/`.
-2. Set secrets: `fly secrets set DATABASE_URL=... API_KEYS=... ANTHROPIC_API_KEY=... OPENAI_API_KEY=...`. With `ENVIRONMENT=production` (set in `fly.toml`) the API refuses to start without `API_KEYS`.
-3. Run `fly deploy`. The release command runs `docpilot db init`. `/readyz` is the health check; `/healthz` only says the process is up.
+2. Set secrets: `fly secrets set DATABASE_URL=... REDIS_URL=... API_KEYS=... JWT_SECRETS=... ANTHROPIC_API_KEY=... OPENAI_API_KEY=...`. With `ENVIRONMENT=production` (set in `fly.toml`) the API refuses to start without `API_KEYS` or `JWT_SECRETS`. For Redis, `fly redis create` (Upstash) works.
+3. Run `fly deploy`. The release command runs `docpilot db init`. `/readyz` is the health check; `/healthz` only says the process is up. `fly.toml` defines two process groups, `app` and `worker`; scale them separately with `fly scale count app=2 worker=1`.
 4. Set `CORS_ORIGINS` to your Vercel URL.
 
 **Database:** Neon or Supabase free tier. Both support `CREATE EXTENSION vector`.
@@ -217,16 +231,20 @@ api/
   src/docpilot/
     app.py              FastAPI factory, lifespan, CORS, /healthz
     config.py           all settings (env vars)
-    db.py, migrations/  connection pool, versioned plain-SQL migrations (`docpilot db init`)
-    store.py            raw SQL for documents, messages, traces
+    db.py, migrations/  connection pool, tenant-scoped transactions (RLS), versioned migrations
+    store.py            raw SQL for documents, messages, traces (every query tenant-scoped)
+    auth.py             argon2id passwords, JWT access tokens, rotating refresh tokens
+    security.py         who is calling (user / API key) and rate limits (Redis or local)
+    cache.py            per-tenant query-embedding and search-result caches (Redis)
+    jobs.py, worker.py  background ingest: job table, progress, retries, sweeper (arq)
     ingest/             parse (PDF/HTML/MD) -> heading-aware chunker -> pipeline
     embeddings.py       openai-compatible | fake
     retrieval/          search.py (vector/fts/hybrid), fusion.py (RRF), rerank.py (Cohere)
     llm/                provider adapters: anthropic, openai-compatible, fake
     agent/              loop.py, tools.py, prompts.py, citations.py
     chat_stream.py      agent events -> AI SDK UI message stream (ui_stream.py = wire format)
-    routes/             documents.py (+ /search), chat.py (+ conversations, traces)
-  tests/                unit tests (no DB/keys) + one DB-backed end-to-end test
+    routes/             documents.py (+ /search), chat.py (+ conversations, traces), auth.py, jobs.py
+  tests/                unit tests (no DB/keys); DB-backed: tenancy, auth, jobs; Redis-backed
 web/src/
   app/                  / (chat), /library
   components/           Chat, AnswerText (citation chips), SourcePanel, TracePanel, Library
@@ -234,4 +252,8 @@ web/src/
 evals/
   corpus/, dataset.jsonl, baseline.json
   run.py, metrics.py, judge.py, compare.py, spotcheck.py, dataset.py
+loadtest/
+  locustfile.py         many tenants searching, chatting and uploading at once
+  hnsw_filter.py        vector search under a tenant filter: plans, latency, rows returned
+docs/backend.md         tenancy, RLS, accounts, Redis, ingest queue, load test results
 ```

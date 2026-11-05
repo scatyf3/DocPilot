@@ -36,7 +36,7 @@ jobs:
           cache: pip
           cache-dependency-path: api/pyproject.toml
       - run: pip install -e "api[dev]"
-      - run: ruff check api/src api/tests evals
+      - run: ruff check api/src api/tests evals loadtest
       - run: python -m evals.dataset
       - run: pytest api -q
 

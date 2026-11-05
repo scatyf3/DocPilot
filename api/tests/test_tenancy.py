@@ -316,7 +316,7 @@ async def test_chunks_cannot_disagree_with_their_document_about_tenant(app):
 async def test_small_tenant_gets_full_vector_results_in_a_big_index(app, client):
     """A tenant filter must not cut vector results short.
 
-    At this size the planner may well scan exactly; docs/tenancy.md has the 45k-chunk
+    At this size the planner may well scan exactly; docs/backend.md has the 45k-chunk
     measurement where it uses HNSW, and only the iterative scan returns all 30 candidates.
     """
     from docpilot import store
