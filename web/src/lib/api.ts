@@ -1,5 +1,5 @@
 // Thin typed client for the FastAPI backend, reached through the server-side proxy route.
-import type { DocumentDetail, DocumentSummary, TraceDetail } from "./types";
+import type { DocumentDetail, DocumentSummary, IngestJob, TraceDetail, UploadResult } from "./types";
 
 export const API_URL = "/api/backend";
 
@@ -22,7 +22,19 @@ export const deleteDocument = (id: number) =>
 export function uploadDocument(file: File) {
   const form = new FormData();
   form.append("file", file);
-  return request<{ id: number; chunks: number }>("/documents", { method: "POST", body: form });
+  return request<UploadResult>("/documents", { method: "POST", body: form });
+}
+
+export const getJob = (id: string) => request<IngestJob>(`/jobs/${id}`);
+
+/** Poll a queued upload until it finishes, reporting each state on the way. */
+export async function waitForJob(id: string, onUpdate: (job: IngestJob) => void, intervalMs = 1000) {
+  for (;;) {
+    const job = await getJob(id);
+    onUpdate(job);
+    if (job.status === "succeeded" || job.status === "failed") return job;
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
 }
 
 export const getTrace = (messageId: string) => request<TraceDetail>(`/traces/${messageId}`);

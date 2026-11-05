@@ -1,4 +1,7 @@
-# Fly.io config for the API. Secrets: fly secrets set DATABASE_URL=... API_KEYS=... ANTHROPIC_API_KEY=... OPENAI_API_KEY=...
+# Fly.io config for the API and its ingest worker. Secrets:
+#   fly secrets set DATABASE_URL=... REDIS_URL=... API_KEYS=... JWT_SECRETS=... ANTHROPIC_API_KEY=... OPENAI_API_KEY=...
+# REDIS_URL: e.g. Upstash Redis (`fly redis create`). Scale the two process groups separately:
+#   fly scale count app=2 worker=1
 app = "docpilot-api"
 primary_region = "iad"
 
@@ -8,6 +11,10 @@ primary_region = "iad"
 [deploy]
   release_command = "docpilot db init"
 
+[processes]
+  app = "uvicorn docpilot.app:app --host 0.0.0.0 --port 8000 --no-access-log"
+  worker = "docpilot worker"
+
 [env]
   ENVIRONMENT = "production"
   LOG_JSON = "true"
@@ -16,8 +23,10 @@ primary_region = "iad"
   EMBEDDING_PROVIDER = "openai"
   RETRIEVAL_MODE = "hybrid"
   CORS_ORIGINS = "https://docpilot.vercel.app"
+  INGEST_MODE = "queue"
 
 [http_service]
+  processes = ["app"]
   internal_port = 8000
   force_https = true
   auto_stop_machines = "stop"

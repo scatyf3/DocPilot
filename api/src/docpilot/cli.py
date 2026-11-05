@@ -9,6 +9,7 @@ from docpilot.config import get_settings
 from docpilot.db import init_schema, open_pool
 from docpilot.embeddings import make_embedder
 from docpilot.ingest.pipeline import ingest_file
+from docpilot.observability import configure_logging
 from docpilot.security import DEFAULT_TENANT_ID
 
 
@@ -42,6 +43,7 @@ def main() -> None:
     ingest.add_argument("paths", nargs="+", type=Path)
     ingest.add_argument("--tenant", type=int, default=DEFAULT_TENANT_ID,
                         help="tenant that owns the documents (default: 1, the API-key tenant)")
+    sub.add_parser("worker", help="run the background worker (ingest queue, sweeper; needs REDIS_URL)")
     args = parser.parse_args()
 
     if args.cmd == "db":
@@ -50,6 +52,11 @@ def main() -> None:
     elif args.cmd == "ingest":
         files = [p for path in args.paths for p in (sorted(path.iterdir()) if path.is_dir() else [path])]
         run_async(_ingest(files, args.tenant))
+    elif args.cmd == "worker":
+        from docpilot.worker import run_worker
+
+        configure_logging(get_settings())
+        run_worker()
 
 
 if __name__ == "__main__":

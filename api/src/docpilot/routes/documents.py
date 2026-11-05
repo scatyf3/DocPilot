@@ -4,14 +4,19 @@ Everything here acts on the caller's tenant. Another tenant's document gets the 
 one that doesn't exist, so ids can't be probed.
 """
 
-from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile
-from pydantic import BaseModel, Field
+import logging
 
-from docpilot import store
+from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
+from redis.exceptions import RedisError
+
+from docpilot import jobs, store
 from docpilot.config import RerankerName, RetrievalMode
 from docpilot.ingest.pipeline import ingest_file
 from docpilot.security import CurrentPrincipal, rate_limit
 
+log = logging.getLogger(__name__)
 router = APIRouter()
 
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
@@ -27,15 +32,27 @@ async def read_upload(file: UploadFile) -> bytes:
     return data
 
 
-@router.post("/documents", status_code=201, dependencies=[Depends(rate_limit("upload"))])
-async def upload_document(request: Request, file: UploadFile,
-                          principal: CurrentPrincipal) -> dict:
+@router.post("/documents", status_code=201, dependencies=[Depends(rate_limit("upload"))],
+             responses={202: {"description": "Queued (INGEST_MODE=queue): poll the job"}})
+async def upload_document(request: Request, file: UploadFile, principal: CurrentPrincipal):
+    """Inline mode: index the file now, 201 {id, chunks}. Queue mode: 202 {job_id}."""
     s = request.app.state
     data = await read_upload(file)
+    filename = file.filename or "upload.md"
+    if s.settings.ingest_mode == "queue":
+        job_id = await jobs.create_job(s.pool, tenant_id=principal.tenant_id,
+                                       created_by=principal.user_id, filename=filename, data=data)
+        try:
+            await jobs.enqueue(s.arq, job_id, principal.tenant_id)
+        except (RedisError, OSError) as e:
+            # The job is safe in Postgres; the worker's sweeper enqueues it once Redis is back.
+            log.warning("could not enqueue ingest job %s: %s", job_id, type(e).__name__)
+        return JSONResponse({"job_id": str(job_id), "status": "queued"}, status_code=202,
+                            headers={"Location": f"/jobs/{job_id}"})
     try:
         doc_id, n_chunks = await ingest_file(
             s.pool, s.embedder, s.settings, tenant_id=principal.tenant_id,
-            filename=file.filename or "upload.md", data=data, created_by=principal.user_id,
+            filename=filename, data=data, created_by=principal.user_id,
             cache=s.cache,
         )
     except ValueError as e:

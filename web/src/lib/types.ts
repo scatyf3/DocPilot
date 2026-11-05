@@ -55,3 +55,20 @@ export type DocPilotDataParts = {
 export type ChatMessage = UIMessage<never, DocPilotDataParts>;
 
 export type RetrievalMode = "hybrid" | "vector" | "fts";
+
+// A background ingest job (API running with INGEST_MODE=queue). See api/src/docpilot/jobs.py.
+export type IngestJob = {
+  id: string;
+  filename: string;
+  status: "queued" | "running" | "succeeded" | "failed";
+  stage: "parsing" | "embedding" | "storing" | null;
+  chunks_done: number;
+  chunks_total: number | null;
+  progress: number | null;
+  attempts: number;
+  error: string | null;
+  document_id: number | null;
+};
+
+// POST /documents: indexed at once (inline mode), or queued (queue mode).
+export type UploadResult = { id: number; chunks: number } | { job_id: string; status: "queued" };

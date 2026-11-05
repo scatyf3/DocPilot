@@ -2,8 +2,19 @@
 
 import { useRouter, useSearchParams } from "next/navigation";
 import { useCallback, useEffect, useState } from "react";
-import { deleteDocument, getDocument, listDocuments, uploadDocument } from "@/lib/api";
-import type { DocumentDetail, DocumentSummary } from "@/lib/types";
+import { deleteDocument, getDocument, listDocuments, uploadDocument, waitForJob } from "@/lib/api";
+import type { DocumentDetail, DocumentSummary, IngestJob } from "@/lib/types";
+
+function describe(file: string, job: IngestJob): string {
+  if (job.status === "queued") return `${file}: queued`;
+  if (job.status === "failed") return `Failed to index ${file}: ${job.error ?? "unknown error"}`;
+  if (job.status === "succeeded") return `Indexed ${file} (${job.chunks_total} chunks)`;
+  if (job.stage === "embedding" && job.chunks_total) {
+    return `${file}: embedding ${job.chunks_done}/${job.chunks_total} chunks (${Math.round((job.progress ?? 0) * 100)}%)`;
+  }
+  const retry = job.error ? ` (${job.error})` : "";
+  return `${file}: ${job.stage ?? "starting"}…${retry}`;
+}
 
 /** Upload, list and read documents, including pages the agent created with create_page. */
 export function Library() {
@@ -31,7 +42,12 @@ export function Library() {
       setStatus(`Uploading ${file.name}…`);
       try {
         const res = await uploadDocument(file);
-        setStatus(`Indexed ${file.name} (${res.chunks} chunks)`);
+        if ("job_id" in res) {
+          // Queue mode: the API stored the file and a worker indexes it; follow its progress.
+          await waitForJob(res.job_id, (job) => setStatus(describe(file.name, job)));
+        } else {
+          setStatus(`Indexed ${file.name} (${res.chunks} chunks)`);
+        }
       } catch (err) {
         setStatus(`Failed to upload ${file.name}: ${(err as Error).message}`);
       }

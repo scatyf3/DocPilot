@@ -6,34 +6,26 @@ from contextlib import asynccontextmanager
 
 import openai
 import psycopg
-import redis.asyncio as aioredis
+from arq import create_pool
+from arq.connections import RedisSettings
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from psycopg_pool import PoolTimeout
 
 from docpilot.auth import Passwords
-from docpilot.cache import RetrievalCache
+from docpilot.cache import RetrievalCache, make_redis
 from docpilot.config import Settings, get_settings
-from docpilot.db import open_pool
+from docpilot.db import open_pool, schema_identity
 from docpilot.embeddings import make_embedder
 from docpilot.llm import make_provider
 from docpilot.observability import RequestContextMiddleware, configure_logging
 from docpilot.retrieval.search import Retriever
-from docpilot.routes import auth, chat, documents
+from docpilot.routes import auth, chat, documents, jobs
 from docpilot.security import RateLimiter, RedisRateLimiter, get_principal
 
 log = logging.getLogger(__name__)
 READY_TIMEOUT_SECONDS = 3
-
-
-def make_redis(settings: Settings) -> aioredis.Redis | None:
-    if not settings.redis_url:
-        return None
-    # Short timeouts: Redis only speeds requests up or shares counters, so when it's slow we
-    # would rather go without it than wait.
-    return aioredis.from_url(settings.redis_url, socket_timeout=settings.redis_timeout_seconds,
-                             socket_connect_timeout=settings.redis_timeout_seconds)
 
 
 def check_settings(settings: Settings) -> None:
@@ -44,6 +36,8 @@ def check_settings(settings: Settings) -> None:
             raise RuntimeError("JWT_SECRETS must each be at least 32 characters in production")
         if not settings.redis_url:
             log.warning("no REDIS_URL: rate limits are per instance, and nothing is cached")
+    if settings.ingest_mode == "queue" and not settings.redis_url:
+        raise RuntimeError("INGEST_MODE=queue needs REDIS_URL")
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -59,7 +53,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         cache = None
         if redis is not None:
             app.state.rate_limiter = RedisRateLimiter(redis)
-            cache = RetrievalCache(redis, namespace=settings.db_schema,
+            cache = RetrievalCache(redis, namespace=await schema_identity(pool, settings),
                                    search_ttl=settings.search_cache_ttl_seconds,
                                    embedding_ttl=settings.query_embedding_cache_ttl_seconds)
         app.state.pool = pool
@@ -69,12 +63,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.retriever = Retriever(pool, embedder, settings, cache)
         app.state.llm = make_provider(settings)
         app.state.passwords = Passwords(settings)
+        app.state.arq = None
+        if settings.ingest_mode == "queue":
+            app.state.arq = await create_pool(RedisSettings.from_dsn(settings.redis_url))
         try:
             yield
         finally:
             await pool.close()
-            if redis is not None:
-                await redis.aclose()
+            for client in (redis, app.state.arq):
+                if client is not None:
+                    await client.aclose()
 
     app = FastAPI(title="DocPilot API", version="0.1.0", lifespan=lifespan)
     app.state.settings = settings
@@ -102,6 +100,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(auth.router)
     app.include_router(documents.router, dependencies=authenticated)
     app.include_router(chat.router, dependencies=authenticated)
+    app.include_router(jobs.router, dependencies=authenticated)
 
     @app.get("/healthz")
     async def healthz() -> dict:

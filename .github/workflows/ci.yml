@@ -18,9 +18,16 @@ jobs:
         ports: ["5432:5432"]
         options: >-
           --health-cmd "pg_isready -U docpilot" --health-interval 2s --health-retries 30
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 2s --health-retries 30
     env:
       # Set so the DB-backed integration tests run too (fake LLM + embedder, no keys).
       DATABASE_URL: postgresql://docpilot:docpilot@localhost:5432/docpilot
+      # Shared rate limits, caches and the ingest worker. Tests flush this database number.
+      REDIS_URL: redis://localhost:6379/15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

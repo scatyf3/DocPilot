@@ -88,6 +88,19 @@ async def tenant_connection(pool: AsyncConnectionPool, tenant_id: int,
         yield conn
 
 
+async def schema_identity(pool: AsyncConnectionPool, settings: Settings) -> str:
+    """Names this incarnation of the schema: dropping and recreating it changes the OID.
+
+    Caches key on this, so results cached for a schema that evals have since reset (and whose
+    ids now mean different rows) are never served for the new one.
+    """
+    async with pool.connection() as conn:
+        row = await (await conn.execute(
+            "SELECT oid::bigint AS oid FROM pg_namespace WHERE nspname = %s", (settings.db_schema,),
+        )).fetchone()
+    return f"{settings.db_schema}.{row['oid'] if row else 0}"
+
+
 def _migrations() -> list[tuple[int, str, str]]:
     """(version, name, sql) from migrations/NNNN_name.sql, in order. Add files, never edit them."""
     found = []

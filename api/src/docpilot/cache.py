@@ -27,6 +27,15 @@ log = logging.getLogger(__name__)
 PREFIX = "docpilot:"
 
 
+def make_redis(settings) -> aioredis.Redis | None:
+    if not settings.redis_url:
+        return None
+    # Short timeouts: Redis only speeds requests up or shares counters, so when it's slow we
+    # would rather go without it than wait.
+    return aioredis.from_url(settings.redis_url, socket_timeout=settings.redis_timeout_seconds,
+                             socket_connect_timeout=settings.redis_timeout_seconds)
+
+
 def _digest(*parts: object) -> str:
     return hashlib.sha256(json.dumps(parts, sort_keys=True, default=str).encode()).hexdigest()
 
@@ -36,7 +45,7 @@ class RetrievalCache:
 
     def __init__(self, client: aioredis.Redis, *, namespace: str, search_ttl: int, embedding_ttl: int):
         self._redis = client
-        # The DB schema is part of the namespace: eval schemas share Redis with the app.
+        # Names the DB schema (see db.schema_identity): eval schemas share Redis with the app.
         self._ns = f"{PREFIX}{namespace}:"
         self._search_ttl = search_ttl
         self._embedding_ttl = embedding_ttl

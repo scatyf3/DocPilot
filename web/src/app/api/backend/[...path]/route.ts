@@ -6,7 +6,7 @@ const API_KEY = process.env.API_KEY;
 // platform that overwrites it (Vercel does). Otherwise all traffic shares one rate-limit bucket,
 // which fails safe: strict limits rather than limits anyone can dodge with a made-up header.
 const TRUST_FORWARDED_FOR = process.env.TRUST_FORWARDED_FOR === "true";
-const ALLOWED = /^(documents(\/\d+)?|chat|traces\/[0-9a-f-]+|conversations\/[^/]+)$/;
+const ALLOWED = /^(documents(\/\d+)?|chat|traces\/[0-9a-f-]+|conversations\/[^/]+|jobs(\/[0-9a-f-]+)?)$/;
 
 // Connection-specific, or describing the body as received rather than as we re-send it.
 // x-client-ip is ours to set: a browser sending its own would dodge the rate limits.
