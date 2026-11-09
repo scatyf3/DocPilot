@@ -101,6 +101,10 @@ class Settings(BaseSettings):
     embedding_model: str = "text-embedding-3-small"
     embedding_dim: int = 1024
     embedding_batch_size: int = 64
+    # Separate endpoint for embeddings, e.g. a local bge-m3 server while chat goes to a hosted API
+    # that has no /embeddings. Unset falls back to OPENAI_BASE_URL / OPENAI_API_KEY.
+    embedding_base_url: str | None = None
+    embedding_api_key: str | None = None
 
     # Chunking (token counts are approximate: ~0.75 words per token).
     chunk_tokens: int = 500

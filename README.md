@@ -106,6 +106,18 @@ EMBEDDING_PROVIDER=openai                  # embeddings go through the same base
 EMBEDDING_MODEL=text-embedding-3-small     # must support dimensions=1024
 ```
 
+To send chat and embeddings to different places, for example a hosted chat API that has no `/embeddings` (DeepSeek) plus a local embedding server, set `EMBEDDING_BASE_URL` (and `EMBEDDING_API_KEY` if it needs one). Unset, they fall back to `OPENAI_BASE_URL` / `OPENAI_API_KEY`:
+
+```bash
+LLM_PROVIDER=openai
+OPENAI_BASE_URL=https://api.deepseek.com
+OPENAI_API_KEY=<deepseek key>
+CHAT_MODEL=deepseek-v4-pro
+EMBEDDING_BASE_URL=http://localhost:8001/v1  # local bge-m3
+EMBEDDING_API_KEY=local                      # any non-empty value if the server ignores it
+EMBEDDING_MODEL=BAAI/bge-m3
+```
+
 Tool calls, streaming and token usage (`stream_options.include_usage`) all go through the gateway unchanged. Cost per trace uses the price table in `api/src/docpilot/pricing.py`. Models missing from that table are recorded at $0 and a warning is logged.
 
 ## Evals

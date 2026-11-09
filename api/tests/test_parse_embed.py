@@ -1,7 +1,8 @@
 import numpy as np
 import pytest
 
-from docpilot.embeddings import FakeEmbedder
+from docpilot.config import Settings
+from docpilot.embeddings import FakeEmbedder, OpenAIEmbedder
 from docpilot.ingest.parse import parse_document
 
 
@@ -29,3 +30,16 @@ async def test_fake_embedder_is_deterministic_normalised_and_lexical():
     assert a.shape == (1024,) and np.isclose(np.linalg.norm(a), 1.0)
     assert np.allclose(a, (await emb.embed(["on-call pager rotation"]))[0])
     assert float(a @ b) > float(a @ c)
+
+
+def test_embeddings_can_use_their_own_endpoint_and_fall_back_to_openai():
+    shared = Settings(_env_file=None, openai_base_url="https://chat.example/v1", openai_api_key="chat-key")
+    client = OpenAIEmbedder(shared)._client
+    assert str(client.base_url).startswith("https://chat.example/v1")
+    assert client.api_key == "chat-key"
+
+    split = shared.model_copy(update={"embedding_base_url": "http://localhost:8001/v1",
+                                      "embedding_api_key": "local"})
+    client = OpenAIEmbedder(split)._client
+    assert str(client.base_url).startswith("http://localhost:8001/v1")
+    assert client.api_key == "local"
