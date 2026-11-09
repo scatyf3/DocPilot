@@ -273,3 +273,7 @@ loadtest/
   hnsw_filter.py        vector search under a tenant filter: plans, latency, rows returned
 docs/backend.md         tenancy, RLS, accounts, Redis, ingest queue, load test results
 ```
+
+contribution
+
+1. rag，用pgvector和opensource embedding库，
