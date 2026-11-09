@@ -223,6 +223,10 @@ python -m evals.bench_matrix --llm openai --out evals/results/matrix   # rerun t
 
 ## Deploy
 
+**One server (e.g. AWS EC2):** `docker-compose.prod.yml` runs the whole stack behind Caddy with automatic HTTPS. Step by step: [deploy/README.md](deploy/README.md).
+
+Or split it across managed platforms:
+
 **API on Fly.io** (`api/fly.toml`):
 1. Run `fly launch --no-deploy` from `api/`.
 2. Set secrets: `fly secrets set DATABASE_URL=... REDIS_URL=... API_KEYS=... JWT_SECRETS=... ANTHROPIC_API_KEY=... OPENAI_API_KEY=...`. With `ENVIRONMENT=production` (set in `fly.toml`) the API refuses to start without `API_KEYS` or `JWT_SECRETS`. For Redis, `fly redis create` (Upstash) works.

@@ -1,0 +1,105 @@
+# Single-host production stack, e.g. one EC2 instance. Differences from docker-compose.yml:
+# Caddy terminates HTTPS and is the only thing listening on the internet; Postgres, Redis and the
+# API are reachable only inside the compose network; passwords and keys must be set; every
+# service restarts on failure and after a reboot.
+#
+#   cp .env.example .env    # fill in the "Production" block at the bottom and the model keys
+#   docker compose -f docker-compose.prod.yml up -d --build
+#
+# Setup from a fresh instance: deploy/README.md.
+x-required:
+  # Fail at `docker compose up` rather than at runtime when a secret is missing.
+  postgres-password: &pg-password ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+  api-key: &api-key ${API_KEY:?set API_KEY in .env}
+
+services:
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    environment:
+      DOMAIN: ${DOMAIN:?set DOMAIN in .env, e.g. 203-0-113-7.sslip.io}
+    ports: ["80:80", "443:443", "443:443/udp"]
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data        # certificates: keep them, or Let's Encrypt rate limits bite
+      - caddy_config:/config
+    depends_on: [web]
+
+  db:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: docpilot
+      POSTGRES_PASSWORD: *pg-password
+      POSTGRES_DB: docpilot
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U docpilot"]
+      interval: 2s
+      retries: 30
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      retries: 30
+
+  api:
+    build: ./api
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    # These override anything with the same name in .env.
+    environment: &api-env
+      ENVIRONMENT: production
+      LOG_JSON: "true"
+      DATABASE_URL: postgresql://docpilot:${POSTGRES_PASSWORD}@db:5432/docpilot
+      REDIS_URL: redis://redis:6379/0
+      INGEST_MODE: queue
+      API_KEYS: *api-key
+      # The API is only reachable through the web app, which sets this header from the address
+      # Caddy saw, so clients can't forge it.
+      CLIENT_IP_HEADER: x-client-ip
+      CORS_ORIGINS: https://${DOMAIN}
+    command: sh -c "docpilot db init && uvicorn docpilot.app:app --host 0.0.0.0 --port 8000 --workers 2 --no-access-log"
+    volumes: ["./evals/corpus:/corpus:ro"]   # sample docs: docker compose ... exec api docpilot ingest /corpus
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/readyz')"]
+      interval: 10s
+      start_period: 30s
+      retries: 3
+    depends_on:
+      db: { condition: service_healthy }
+      redis: { condition: service_healthy }
+
+  worker:
+    build: ./api
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    environment: *api-env
+    command: sh -c "docpilot db init && docpilot worker"
+    depends_on:
+      db: { condition: service_healthy }
+      redis: { condition: service_healthy }
+
+  web:
+    build: ./web
+    restart: unless-stopped
+    environment:
+      API_URL: http://api:8000
+      API_KEY: *api-key
+      WEB_PASSWORD: ${WEB_PASSWORD:?set WEB_PASSWORD in .env}
+      # Caddy replaces any X-Forwarded-For the client sent with the address it actually saw.
+      TRUST_FORWARDED_FOR: "true"
+    depends_on:
+      api: { condition: service_healthy }
+
+volumes:
+  pgdata:
+  caddy_data:
+  caddy_config:

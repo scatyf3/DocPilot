@@ -1,0 +1,6 @@
+# HTTPS in front of the web app. Caddy gets and renews the certificate for $DOMAIN by itself
+# (Let's Encrypt), and redirects http to https.
+{$DOMAIN} {
+	# No `encode` here: compressing would buffer the chat's event stream.
+	reverse_proxy web:3000
+}
