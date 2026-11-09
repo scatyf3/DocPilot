@@ -20,5 +20,7 @@ out/
 # Eval outputs (the committed baseline lives at evals/baseline.json)
 evals/results/*
 !evals/results/.gitkeep
+# Public benchmark data (python -m evals.benchmarks download); never committed
+evals/data/
 
 .DS_Store

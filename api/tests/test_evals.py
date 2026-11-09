@@ -191,6 +191,13 @@ def test_answer_matches():
     assert not answer_matches("anything", "")
 
 
+def test_answer_matches_strips_unicode_punctuation():
+    assert normalize_answer("Yes—broadly consistent") == "yes broadly consistent"
+    assert answer_matches("**Yes—broadly consistent.**", "Yes")
+    assert answer_matches("“Don’t Stop” was the single.", "Don’t Stop")
+    assert answer_matches("He played for Bayern Munich…", "Bayern Munich")
+
+
 def test_cited_gold_by_document_and_by_quote():
     doc_item = BenchItem("h1", "?", "bridge", ["Paris", "Lyon"], "x")
     assert cited_gold([{"title": "Lyon", "text": ""}], doc_item, "doc")

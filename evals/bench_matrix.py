@@ -42,6 +42,7 @@ import json
 import random
 import string
 import time
+import unicodedata
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -78,10 +79,16 @@ YES_NO = {"yes", "no"}
 
 # --- answer scoring ---------------------------------------------------------------------------
 
+def _is_punct(ch: str) -> bool:
+    # Unicode punctuation too: models write "Yes—broadly" or "it’s", and an em dash glued to
+    # "yes" would otherwise hide the yes/no token.
+    return ch in string.punctuation or unicodedata.category(ch).startswith("P")
+
+
 def normalize_answer(text: str) -> str:
-    """SQuAD-style: drop citation markers, case, punctuation and articles."""
+    """SQuAD-style: drop citation markers, case, punctuation (ASCII and Unicode) and articles."""
     text = CITATION.sub(" ", text).lower()
-    text = "".join(" " if ch in string.punctuation else ch for ch in text)
+    text = "".join(" " if _is_punct(ch) else ch for ch in text)
     return " ".join(w for w in text.split() if w not in ("a", "an", "the"))
 
 
